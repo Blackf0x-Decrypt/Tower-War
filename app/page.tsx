@@ -1,5 +1,5 @@
 'use client';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { TroopLayer } from '@/components/troop-layer';
 import { OwnershipFilters } from '@/components/ownership-filters';
 import {
@@ -69,6 +69,34 @@ import {
   type Game,
 } from '@/lib/tower-game';
 
+const SEAT_STORAGE_KEY = 'tower-seat';
+
+type SavedSeat = { playerId: string; team: Team; name: string };
+
+function readSavedSeat(): SavedSeat | null {
+  try {
+    const raw = localStorage.getItem(SEAT_STORAGE_KEY);
+    if (!raw) return null;
+    const data = JSON.parse(raw) as Partial<SavedSeat>;
+    if (typeof data.playerId !== 'string' || !data.playerId) return null;
+    if (!TEAM_IDS.includes(data.team as Team)) return null;
+    const name =
+      typeof data.name === 'string' && data.name.trim()
+        ? data.name.trim().slice(0, 16)
+        : 'Игрок';
+    return { playerId: data.playerId, team: data.team as Team, name };
+  } catch {
+    return null;
+  }
+}
+
+function writeSavedSeat(seat: SavedSeat | null) {
+  try {
+    if (!seat) localStorage.removeItem(SEAT_STORAGE_KEY);
+    else localStorage.setItem(SEAT_STORAGE_KEY, JSON.stringify(seat));
+  } catch {}
+}
+
 export default function Home() {
   const [camera, setCamera] = useState<Camera>({ x: 0, y: 0, zoom: 0.8 });
   const cameraRef = useRef(camera);
@@ -107,6 +135,7 @@ export default function Home() {
   const [typingSeconds, setTypingSeconds] = useState(10);
   const [started, setStarted] = useState(false);
   const [seat, setSeat] = useState<{ id: string; team: Team } | null>(null);
+  const [resuming, setResuming] = useState(false);
   const [callName, setCallName] = useState('Игрок');
   const [picked, setPicked] = useState<Team>('you');
   const [roomError, setRoomError] = useState('');
@@ -119,7 +148,7 @@ export default function Home() {
     you: { team: Team; ready: boolean } | null;
   } | null>(null);
   const seatRef = useRef(seat);
-  seatRef.current = seat;
+  if (seat) seatRef.current = seat;
   const sharedRef = useRef(false);
   const meRef = useRef<Team>('you');
   meRef.current = seat?.team ?? 'you';
@@ -188,6 +217,16 @@ export default function Home() {
   gameRef.current = game;
   const activeRef = useRef(false);
   activeRef.current = started && !paused && !help && !game.result && !recording;
+  useLayoutEffect(() => {
+    const saved = readSavedSeat();
+    if (!saved) return;
+    const next = { id: saved.playerId, team: saved.team };
+    seatRef.current = next;
+    setSeat(next);
+    setCallName(saved.name);
+    setPicked(saved.team);
+    setResuming(true);
+  }, []);
   useEffect(() => {
     fetch('/api/decree')
       .then(async (r) => (await r.json()) as { provider?: string })
@@ -206,6 +245,10 @@ export default function Home() {
     let ticket = 0;
     let misses = 0;
     const pull = async () => {
+      if (!seatRef.current) {
+        const saved = readSavedSeat();
+        if (saved) seatRef.current = { id: saved.playerId, team: saved.team };
+      }
       const id = seatRef.current?.id;
       const mine = ++ticket;
       try {
@@ -213,7 +256,13 @@ export default function Home() {
           '/api/room' + (id ? `?player=${encodeURIComponent(id)}` : ''),
           { cache: 'no-store' },
         );
-        if (!response.ok) return;
+        if (!response.ok) {
+          try {
+            const failed = (await response.json()) as { error?: string };
+            if (failed.error) setRoomError(failed.error);
+          } catch {}
+          return;
+        }
         const data = (await response.json()) as {
           seats: { name: string; team: Team; ready: boolean }[];
           started: boolean;
@@ -227,8 +276,11 @@ export default function Home() {
         if (id && seatRef.current?.id === id && !data.you) {
           misses += 1;
           if (misses < 2) return;
+          writeSavedSeat(null);
           sharedRef.current = false;
+          seatRef.current = null;
           setSeat(null);
+          setResuming(false);
           setStarted(false);
           setLobby(data);
           return;
@@ -241,11 +293,15 @@ export default function Home() {
           setStarted(true);
           setPaused(data.paused);
           setGame(data.game);
+          setResuming(false);
         } else if (sharedRef.current && !data.started) {
           sharedRef.current = false;
           initialized.current = false;
           setStarted(false);
           setGame(initialGame());
+          setResuming(false);
+        } else if (data.you) {
+          setResuming(false);
         }
       } catch {}
     };
@@ -537,8 +593,10 @@ export default function Home() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ op: 'leave', playerId: seatRef.current.id }),
       });
+      writeSavedSeat(null);
       seatRef.current = null;
       setSeat(null);
+      setResuming(false);
     }
     sharedRef.current = false;
     setBusy(false);
@@ -590,10 +648,13 @@ export default function Home() {
       return;
     }
     const next = { id: data.playerId, team: data.team };
+    const name = callName.trim().slice(0, 16) || 'Игрок';
     seatRef.current = next;
     meRef.current = data.team;
     setSeat(next);
     setPicked(data.team);
+    setResuming(false);
+    writeSavedSeat({ playerId: data.playerId, team: data.team, name });
   }
   async function toggleReady() {
     if (!seatRef.current) return;
@@ -769,6 +830,18 @@ export default function Home() {
     setMessageDraft('');
     setPromptMessage('Сообщение над штабом · 10 секунд');
   }
+  if (!started && resuming)
+    return (
+      <main className="start-screen">
+        <div className="start-cloud">
+          <span>СТРАТЕГИЯ, В КОТОРОЙ ВЛАСТЬ МЕНЯЕТ ПРАВИЛА</span>
+        </div>
+        <section className="start-panel">
+          <p>Возвращаем вас в матч…</p>
+          {roomError && <p className="room-error">{roomError}</p>}
+        </section>
+      </main>
+    );
   if (!started)
     return (
       <main className="start-screen">
@@ -835,7 +908,12 @@ export default function Home() {
                       void sit(id);
                       return;
                     }
-                    void roomPost({ op: 'leave', playerId: seat.id }).then(() => {
+                    void roomPost({ op: 'leave', playerId: seat.id }).then((left) => {
+                      if (left.error) {
+                        setRoomError(left.error);
+                        return;
+                      }
+                      writeSavedSeat(null);
                       if (seatRef.current?.id === seat.id) seatRef.current = null;
                       return sit(id);
                     });

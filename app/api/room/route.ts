@@ -1,10 +1,31 @@
-import { roomCommand, roomView } from '@/lib/room';
+import { RoomBusyError } from '@/lib/room-store';
+import { roomCommand, roomView, type RoomView } from '@/lib/room';
+
+function json(body: unknown, status = 200) {
+  return Response.json(body, {
+    status,
+    headers: { 'Cache-Control': 'no-store' },
+  });
+}
+
+function statusFor(result: RoomView) {
+  if (result.code === 'redis_missing') return 503;
+  if (result.error && !('seats' in result)) return 400;
+  return 200;
+}
 
 export async function GET(request: Request) {
   const player = new URL(request.url).searchParams.get('player');
-  return Response.json(roomView(player), {
-    headers: { 'Cache-Control': 'no-store' },
-  });
+  try {
+    const view = await roomView(player);
+    return json(view, statusFor(view));
+  } catch (error) {
+    const message =
+      error instanceof RoomBusyError
+        ? error.message
+        : 'Комната временно недоступна. Обновите страницу.';
+    return json({ error: message }, { status: 503 });
+  }
 }
 
 export async function POST(request: Request) {
@@ -12,12 +33,16 @@ export async function POST(request: Request) {
   try {
     body = await request.json();
   } catch {
-    return Response.json({ error: 'Некорректный запрос.' }, { status: 400 });
+    return json({ error: 'Некорректный запрос.' }, { status: 400 });
   }
-  const result = roomCommand(body);
-  const status = 'error' in result && !('seats' in result) ? 400 : 200;
-  return Response.json(result, {
-    status,
-    headers: { 'Cache-Control': 'no-store' },
-  });
+  try {
+    const result = await roomCommand(body);
+    return json(result, statusFor(result));
+  } catch (error) {
+    const message =
+      error instanceof RoomBusyError
+        ? error.message
+        : 'Комната временно недоступна. Обновите страницу.';
+    return json({ error: message }, { status: 503 });
+  }
 }
