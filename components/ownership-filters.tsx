@@ -1,5 +1,15 @@
-/** Recolour blue team trim without changing gold, timber or stone materials. */
+/** Light team tint. Keeps gold, timber and stone; does not flatten the sprite. */
 export function OwnershipFilters() {
+  const tint: Record<string, string> = {
+    neutral:
+      '1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0',
+    red:
+      '1.08 0.04 0 0 0.05  0 0.9 0 0 0  0 0 0.84 0 0  0 0 0 1 0',
+    purple:
+      '1.02 0 0.04 0 0.03  0 0.9 0 0 0.01  0.02 0 1.06 0 0.04  0 0 0 1 0',
+    green:
+      '0.86 0 0 0 0  0.04 1.06 0 0 0.03  0 0 0.88 0 0  0 0 0 1 0',
+  };
   return (
     <svg
       width="0"
@@ -13,58 +23,15 @@ export function OwnershipFilters() {
             key={team}
             id={`resource-${team}`}
             colorInterpolationFilters="sRGB"
-            x="-10%"
-            y="-10%"
-            width="120%"
-            height="120%"
+            x="-20%"
+            y="-20%"
+            width="140%"
+            height="140%"
           >
             <feColorMatrix
               in="SourceGraphic"
               type="matrix"
-              values="0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  -1 -0.3 1.3 0 0"
-              result="blueChannel"
-            />
-            <feComponentTransfer in="blueChannel" result="blueThreshold">
-              <feFuncA type="linear" slope="10" intercept="-0.5" />
-            </feComponentTransfer>
-            <feComposite
-              in="blueThreshold"
-              in2="SourceAlpha"
-              operator="in"
-              result="trimMask"
-            />
-            <feColorMatrix
-              in="SourceGraphic"
-              type={team === 'neutral' ? 'saturate' : 'hueRotate'}
-              values={
-                team === 'neutral'
-                  ? '0'
-                  : team === 'red'
-                    ? '140'
-                    : team === 'purple'
-                      ? '45'
-                      : '-85'
-              }
-              result="coloured"
-            />
-            <feComposite
-              in="coloured"
-              in2="trimMask"
-              operator="in"
-              result="teamTrim"
-            />
-            <feComposite
-              in="SourceGraphic"
-              in2="trimMask"
-              operator="out"
-              result="materials"
-            />
-            <feComposite
-              in="materials"
-              in2="teamTrim"
-              operator="arithmetic"
-              k2="1"
-              k3="1"
+              values={tint[team]}
             />
           </filter>
         ))}

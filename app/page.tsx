@@ -147,6 +147,7 @@ export default function Home() {
     game: Game | null;
     you: { team: Team; ready: boolean } | null;
   } | null>(null);
+  const [clock, setClock] = useState(0);
   const seatRef = useRef(seat);
   if (seat) seatRef.current = seat;
   const sharedRef = useRef(false);
@@ -330,6 +331,11 @@ export default function Home() {
       window.removeEventListener('pageshow', onWake);
     };
   }, [seat]);
+  useEffect(() => {
+    if (!lobby?.startAt || started) return;
+    const timer = window.setInterval(() => setClock(Date.now()), 200);
+    return () => window.clearInterval(timer);
+  }, [lobby?.startAt, started]);
   useEffect(() => {
     const flight = spellFlight.current;
     if (!flight || flight.abort.signal.aborted) return;
@@ -845,6 +851,16 @@ export default function Home() {
   if (!started)
     return (
       <main className="start-screen">
+        {lobby?.startAt != null && (
+          <div className="start-countdown">
+            {Math.max(
+              1,
+              Math.ceil(
+                (lobby.startAt - (clock || Date.now())) / 1000,
+              ),
+            )}
+          </div>
+        )}
         <div className="start-settings">
           <button
             className="square-button"
@@ -964,7 +980,7 @@ export default function Home() {
           )}
           <p>
             {lobby?.startAt
-              ? `Все готовы. Общий старт через ${Math.max(1, Math.ceil((lobby.startAt - Date.now()) / 1000))} с.`
+              ? `Все готовы. Общий старт через ${Math.max(1, Math.ceil((lobby.startAt - (clock || Date.now())) / 1000))} с.`
               : (lobby?.seats.length ?? 0) < 2
                 ? 'Нужны минимум двое. Каждый выбирает свой цвет и нажимает «Готов».'
                 : 'Бой начнётся, когда готов каждый, кто сел за стол. Пустые цвета остаются ботами.'}
@@ -999,6 +1015,8 @@ export default function Home() {
             <b>Солнечная долина</b>
           </div>
         </div>
+      </header>
+      <div className="hud-corner">
         <div className="header-actions">
           <button
             className="square-button"
@@ -1008,7 +1026,6 @@ export default function Home() {
             <Settings size={17} />
           </button>
           {showSettings && settingsPanel}
-
           <button
             aria-pressed={showStats}
             onClick={() => setShowStats(!showStats)}
@@ -1027,7 +1044,56 @@ export default function Home() {
             <RotateCcw size={20} />
           </button>
         </div>
-      </header>
+        <div className="battle-clock">
+          <div className="clock">
+            <i />
+            {Math.floor(remaining / 60)}:
+            {String(remaining % 60).padStart(2, '0')}
+          </div>
+          <button
+            className="square-button"
+            aria-label={paused ? 'Продолжить' : 'Пауза'}
+            disabled={!!game.result}
+            onClick={() => {
+              if (sharedRef.current && seatRef.current) {
+                void roomPost({
+                  op: 'pause',
+                  playerId: seatRef.current.id,
+                  paused: !paused,
+                });
+                return;
+              }
+              setPaused(!paused);
+            }}
+          >
+            {paused ? <Play size={19} /> : <Pause size={19} />}
+          </button>
+        </div>
+        <nav className="camera-controls" aria-label="Управление картой">
+          <button onClick={() => changeZoom(1.2)} aria-label="Приблизить">
+            <Plus size={18} />
+          </button>
+          <span>{Math.round(camera.zoom * 100)}%</span>
+          <button onClick={() => changeZoom(1 / 1.2)} aria-label="Отдалить">
+            <Minus size={18} />
+          </button>
+          <button
+            onClick={focusHome}
+            title="К своему штабу"
+            aria-label="К своему штабу"
+          >
+            <Crosshair size={18} />
+          </button>
+          <button
+            onClick={() => {
+              const v = viewportRef.current;
+              focusPoint(50, 50, Math.min(v.w / WORLD_WIDTH, v.h / WORLD_HEIGHT));
+            }}
+          >
+            Обзор
+          </button>
+        </nav>
+      </div>
       <section className="dominion">
         <div className="dominion-heading">
           <span>
@@ -1106,30 +1172,6 @@ export default function Home() {
           Улучшения не отнимают очки.
         </small>
       </aside>
-      <nav className="camera-controls" aria-label="Управление картой">
-        <button onClick={() => changeZoom(1.2)} aria-label="Приблизить">
-          <Plus size={18} />
-        </button>
-        <span>{Math.round(camera.zoom * 100)}%</span>
-        <button onClick={() => changeZoom(1 / 1.2)} aria-label="Отдалить">
-          <Minus size={18} />
-        </button>
-        <button
-          onClick={focusHome}
-          title="К своему штабу"
-          aria-label="К своему штабу"
-        >
-          <Crosshair size={18} />
-        </button>
-        <button
-          onClick={() => {
-            const v = viewportRef.current;
-            focusPoint(50, 50, Math.min(v.w / WORLD_WIDTH, v.h / WORLD_HEIGHT));
-          }}
-        >
-          Обзор
-        </button>
-      </nav>
       <button
         className="minimap"
         aria-label="Обзор карты: нажмите, чтобы переместить камеру"
@@ -1183,29 +1225,6 @@ export default function Home() {
               </div>
             ))}
           </div>
-          <div className="clock">
-            <i />
-            {Math.floor(remaining / 60)}:
-            {String(remaining % 60).padStart(2, '0')}
-          </div>
-          <button
-            className="square-button"
-            aria-label={paused ? 'Продолжить' : 'Пауза'}
-            disabled={!!game.result}
-            onClick={() => {
-              if (sharedRef.current && seatRef.current) {
-                void roomPost({
-                  op: 'pause',
-                  playerId: seatRef.current.id,
-                  paused: !paused,
-                });
-                return;
-              }
-              setPaused(!paused);
-            }}
-          >
-            {paused ? <Play size={19} /> : <Pause size={19} />}
-          </button>
         </div>
         <div
           ref={field}
@@ -1303,6 +1322,26 @@ export default function Home() {
               }}
             />
             <div className="battle-units">
+              <svg className="ground-routes" aria-hidden="true">
+                {game.automation.map((route) => {
+                  const a = game.towers[route.from];
+                  const b = game.towers[route.to];
+                  if (!a || !b) return null;
+                  return (
+                    <line
+                      key={`${route.team}-${route.from}-${route.to}`}
+                      x1={a.x}
+                      y1={a.y}
+                      x2={b.x}
+                      y2={b.y}
+                      stroke={TEAMS[route.team].color}
+                      strokeWidth="1.15"
+                      strokeLinecap="round"
+                      opacity="0.72"
+                    />
+                  );
+                })}
+              </svg>
               <svg
                 className="routes"
                 viewBox="0 0 100 100"
@@ -1485,25 +1524,6 @@ export default function Home() {
                     alt=""
                     draggable={false}
                   />
-                  {!['gold', 'lumber'].includes(t.kind) && (
-                    <span className="tower-roof" />
-                  )}
-                  {t.team && hasCannon(t) && (
-                    <span
-                      className="turret-pivot"
-                      style={{ transform: `rotate(${t.aim ?? 0}deg)` }}
-                    >
-                      <img
-                        className={`turret-art ${game.shots?.some((s) => s.from === t.id && game.age - s.at < 0.2) ? 'recoil' : ''}`}
-                        src="/assets/turret.png"
-                        alt=""
-                        draggable={false}
-                      />
-                      {game.shots?.some(
-                        (s) => s.from === t.id && game.age - s.at < 0.12,
-                      ) && <i className="muzzle-flash" />}
-                    </span>
-                  )}
                   {game.spell && t.home && t.team === game.spell.team && (
                     <span className="cast-beacon">
                       <Sparkles size={24} />
@@ -1722,6 +1742,26 @@ export default function Home() {
                       Вы контролируете {yours.length} из {game.towers.length}{' '}
                       зданий.
                     </p>
+                    <table className="earnings-table">
+                      <tbody>
+                        {TEAM_IDS.slice()
+                          .sort(
+                            (a, b) =>
+                              (game.wallets[b]?.earned ?? 0) -
+                              (game.wallets[a]?.earned ?? 0),
+                          )
+                          .map((team) => (
+                            <tr key={team}>
+                              <td>
+                                <i style={{ background: TEAMS[team].color }} />
+                                {playerName(game, team)}
+                                {game.result === team ? ' · победа' : ''}
+                              </td>
+                              <td>{Math.floor(game.wallets[team]?.earned ?? 0)}</td>
+                            </tr>
+                          ))}
+                      </tbody>
+                    </table>
                     <button className="primary" onClick={() => {
                       if (sharedRef.current && seatRef.current) {
                         void roomPost({ op: 'reset', playerId: seatRef.current.id });
@@ -1813,6 +1853,28 @@ export default function Home() {
                   <Eye size={15} />
                 </button>
               </div>
+              {source.team === me && (
+                <button
+                  className="recall-button"
+                  disabled={
+                    paused ||
+                    help ||
+                    !!game.result ||
+                    !game.troops.some(
+                      (p) =>
+                        p.team === me &&
+                        p.from === source.id &&
+                        !p.cargo &&
+                        !p.haul &&
+                        !p.scoutUntil &&
+                        p.progress < 1,
+                    )
+                  }
+                  onClick={() => play({ type: 'recall', from: source.id })}
+                >
+                  Вернуть войска
+                </button>
+              )}
               {!routeMode && (
                 <div className="compact-row segmented">
                   {[0.5, 1].map((n) => (

@@ -159,6 +159,12 @@ export const DEVELOPMENT_SECONDS = 240;
 export const WORLD_WIDTH = 2400;
 export const WORLD_HEIGHT = 1700;
 const MOVE_SPEED = 2.2;
+function worldSpan(ax: number, ay: number, bx: number, by: number) {
+  return Math.hypot(
+    ((ax - bx) / 100) * WORLD_WIDTH,
+    ((ay - by) / 100) * WORLD_HEIGHT,
+  );
+}
 export const KIND_LABEL: Record<Kind, string> = {
   tower: 'Форт',
   gold: 'Золотая шахта',
@@ -446,6 +452,66 @@ export function sendArmy(
         ...next,
         notice: 'Отряд в пути. Перетаскивайте карту, чтобы следить за фронтом.',
       };
+}
+function recallable(p: Troop, actor: Team) {
+  return (
+    p.team === actor &&
+    !p.cargo &&
+    !p.haul &&
+    !p.scoutUntil &&
+    p.progress < 1
+  );
+}
+export function recallTroops(
+  g: Game,
+  actor: Team,
+  from: number | null,
+  id: number | null,
+): Game {
+  if (g.inputLocked?.[actor] || g.result) return g;
+  const hits = g.troops.filter((p) => {
+    if (!recallable(p, actor)) return false;
+    if (id !== null) return p.id === id;
+    return from !== null && p.from === from;
+  });
+  if (!hits.length) return g;
+  const back = new Map<number, number>();
+  for (const p of hits) {
+    const source = g.towers.find((t) => t.id === p.from);
+    if (!source || source.team !== actor || source.ruinedAt !== undefined)
+      continue;
+    back.set(source.id, (back.get(source.id) ?? 0) + p.strength);
+  }
+  const gone = new Set(hits.map((p) => p.id));
+  const troops = g.troops.filter((p) => !gone.has(p.id));
+  const stillMarching = (fromId: number, toId: number) =>
+    troops.some(
+      (p) =>
+        p.team === actor &&
+        p.from === fromId &&
+        p.to === toId &&
+        !p.cargo &&
+        !p.haul &&
+        !p.scoutUntil &&
+        p.progress < 1,
+    );
+  return {
+    ...g,
+    towers: g.towers.map((t) => {
+      const add = back.get(t.id);
+      return add === undefined
+        ? t
+        : { ...t, count: Math.min(1e9, t.count + add) };
+    }),
+    troops,
+    routes: g.routes.filter(
+      (r) => r.team !== actor || stillMarching(r.from, r.to),
+    ),
+    notice:
+      back.size > 0
+        ? 'Войска вернулись в здание.'
+        : 'Отряд снят с дороги. Здание уже не ваше.',
+  };
 }
 export function upgrade(g: Game, id: number, actor: Team = 'you'): Game {
   const t = g.towers.find((t) => t.id === id);
@@ -1009,18 +1075,28 @@ export function tick(previous: Game, dt = 0.05): Game {
         p.sy = p.y;
         p.speech = 'Караван перехвачен!';
       }
-      const home = g.towers
-        .filter((t) => t.home && t.team === p.team)
-        .sort(
-          (a, b) =>
-            Math.hypot(a.x - p.x, a.y - p.y) - Math.hypot(b.x - p.x, b.y - p.y),
-        )[0];
-      if (!home) continue;
-      if (p.to !== home.id) {
-        p.to = home.id;
-        p.sx = p.x;
-        p.sy = p.y;
-        p.progress = 0;
+      const current = g.towers.find((t) => t.id === p.to);
+      const held =
+        current &&
+        current.home &&
+        current.team === p.team &&
+        current.ruinedAt === undefined;
+      if (!held) {
+        const home = g.towers
+          .filter(
+            (t) => t.home && t.team === p.team && t.ruinedAt === undefined,
+          )
+          .sort(
+            (a, b) =>
+              worldSpan(a.x, a.y, p.x, p.y) - worldSpan(b.x, b.y, p.x, p.y),
+          )[0];
+        if (!home) continue;
+        if (p.to !== home.id) {
+          p.to = home.id;
+          p.sx = p.x;
+          p.sy = p.y;
+          p.progress = 0;
+        }
       }
     }
     const target = g.towers.find((t) => t.id === p.to);
@@ -1028,13 +1104,15 @@ export function tick(previous: Game, dt = 0.05): Game {
     const boost = g.towers.some((t) => t.kind === 'relay' && t.team === p.team)
       ? 1.4
       : 1;
+    const span = p.haul
+      ? worldSpan(target.x, target.y, p.sx, p.sy)
+      : Math.hypot(target.x - p.sx, target.y - p.sy);
+    const pace = p.haul
+      ? MOVE_SPEED * ((WORLD_WIDTH + WORLD_HEIGHT) / 200)
+      : MOVE_SPEED;
     p.progress +=
-      (dt *
-        MOVE_SPEED *
-        boost *
-        g.speed[p.team] *
-        modifier(g, p.team, 'speed')) /
-      Math.max(1, Math.hypot(target.x - p.sx, target.y - p.sy));
+      (dt * pace * boost * g.speed[p.team] * modifier(g, p.team, 'speed')) /
+      Math.max(1, span);
     p.x = p.sx + (target.x - p.sx) * Math.min(1, p.progress);
     p.y = p.sy + (target.y - p.sy) * Math.min(1, p.progress);
     if (p.progress < 1) {
@@ -1122,10 +1200,10 @@ export function tick(previous: Game, dt = 0.05): Game {
     )
       continue;
     const home = g.towers
-      .filter((h) => h.team === t.team && h.home)
+      .filter((h) => h.team === t.team && h.home && h.ruinedAt === undefined)
       .sort(
         (a, b) =>
-          Math.hypot(a.x - t.x, a.y - t.y) - Math.hypot(b.x - t.x, b.y - t.y),
+          worldSpan(a.x, a.y, t.x, t.y) - worldSpan(b.x, b.y, t.x, t.y),
       )[0];
     if (!home) continue;
     g.troops.push({

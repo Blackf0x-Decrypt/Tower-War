@@ -5,6 +5,7 @@ import {
   configureAutomation,
   messageOpportunity,
   readySpell,
+  recallTroops,
   sendArmy,
   sendMessage,
   sendScout,
@@ -20,6 +21,8 @@ import {
 
 export type PlayAction =
   | { type: 'army'; from: number; to: number; fraction: number }
+  | { type: 'recall'; from: number }
+  | { type: 'recall-one'; id: number }
   | { type: 'route'; from: number; to: number | null }
   | {
       type: 'route-config';
@@ -51,6 +54,12 @@ export function applyPlay(g: Game, actor: Team, action: PlayAction): Game {
     case 'army':
       if (!num(action.from) || !num(action.to) || !num(action.fraction)) return g;
       return sendArmy(g, action.from, action.to, action.fraction, actor);
+    case 'recall':
+      if (!num(action.from)) return g;
+      return recallTroops(g, actor, action.from, null);
+    case 'recall-one':
+      if (!num(action.id)) return g;
+      return recallTroops(g, actor, null, action.id);
     case 'route':
       if (!num(action.from)) return g;
       return setAutomation(g, action.from, action.to, actor);
