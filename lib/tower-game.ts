@@ -853,6 +853,40 @@ function tiedForLead(g: Game, team: Team) {
 function actingLeader(g: Game, team: Team) {
   return g.authority === team || leader(g) === team;
 }
+const GRID_STRIDE = 8192;
+function gridKey(x: number, y: number, cell: number) {
+  return Math.floor(x / cell) + Math.floor(y / cell) * GRID_STRIDE;
+}
+function fillGrid(
+  grid: Map<number, number[]>,
+  index: number,
+  x: number,
+  y: number,
+  cell: number,
+) {
+  const key = gridKey(x, y, cell);
+  const bucket = grid.get(key);
+  if (bucket) bucket.push(index);
+  else grid.set(key, [index]);
+}
+function nearestHome(list: Tower[], x: number, y: number) {
+  let home = list[0];
+  if (!home) return;
+  let best = worldSpan(home.x, home.y, x, y);
+  for (let i = 1; i < list.length; i++) {
+    const d = worldSpan(list[i].x, list[i].y, x, y);
+    if (d < best) {
+      best = d;
+      home = list[i];
+    }
+  }
+  return home;
+}
+function insertById(list: Tower[], tower: Tower) {
+  let i = 0;
+  while (i < list.length && list[i].id < tower.id) i++;
+  list.splice(i, 0, tower);
+}
 export function refreshAuthority(g: Game): Game {
   const next = leader(g);
   if (next === g.authority) return g;
@@ -872,6 +906,8 @@ export function refreshAuthority(g: Game): Game {
 }
 export function tick(previous: Game, dt = 0.05): Game {
   if (previous.result) return previous;
+  const previousById: Tower[] = [];
+  for (const t of previous.towers) previousById[t.id] = t;
   let g: Game = {
     ...previous,
     age: previous.age + dt,
@@ -895,10 +931,19 @@ export function tick(previous: Game, dt = 0.05): Game {
     troops: [],
     routes: previous.routes.filter((r) => r.until > previous.age),
     automation: previous.automation
-      .filter(
-        (a) => previous.towers.find((t) => t.id === a.from)?.team === a.team,
-      )
+      .filter((a) => previousById[a.from]?.team === a.team)
       .map((a) => ({ ...a })),
+  };
+  const modCache: Record<
+    'income' | 'growth' | 'speed' | 'cannons',
+    Partial<Record<Team, number>>
+  > = { income: {}, growth: {}, speed: {}, cannons: {} };
+  const mod = (team: Team, stat: 'income' | 'growth' | 'speed' | 'cannons') => {
+    const hit = modCache[stat][team];
+    if (hit !== undefined) return hit;
+    const value = modifier(g, team, stat);
+    modCache[stat][team] = value;
+    return value;
   };
   for (const t of g.towers) {
     if (
@@ -918,7 +963,7 @@ export function tick(previous: Game, dt = 0.05): Game {
     const w = g.wallets[t.team],
       earn = income(t);
     const efficiency =
-      modifier(g, t.team, 'income') *
+      mod(t.team, 'income') *
       (g.event?.kind === 'deposit' &&
       g.event.target === t.id &&
       g.event.until > g.age
@@ -933,26 +978,63 @@ export function tick(previous: Game, dt = 0.05): Game {
       t.stockWood = (t.stockWood ?? 0) + earn.resources * dt * efficiency;
     }
     const rate =
-      production(t) * g.growth[t.team] * modifier(g, t.team, 'growth');
+      production(t) * g.growth[t.team] * mod(t.team, 'growth');
     if (t.count < capacity(t))
       t.count = Math.min(capacity(t), t.count + rate * dt);
   }
   const incoming = previous.troops.map((p) => ({ ...p }));
+  const troopById = new Map<number, Troop>();
+  for (const p of incoming) if (!troopById.has(p.id)) troopById.set(p.id, p);
   for (const shot of g.shots ?? []) {
-    const tracked = incoming.find((p) => p.id === shot.target);
+    const tracked =
+      shot.target == null ? undefined : troopById.get(shot.target);
     if (!shot.hit && tracked) {
       shot.x = tracked.x;
       shot.y = tracked.y;
     }
     if (!shot.hit && g.age >= shot.at + (shot.duration ?? 0.4)) {
       shot.hit = true;
-      const victim = incoming.find((p) => p.id === shot.target);
+      const victim =
+        shot.target == null ? undefined : troopById.get(shot.target);
       if (victim && victim.team !== shot.team)
         victim.strength = Math.max(
           0,
           victim.strength - (shot.damage ?? 1) * (victim.elite ? 0.6 : 1),
         );
     }
+  }
+  const byId: Tower[] = [];
+  const relays: Record<Team, number> = { you: 0, red: 0, purple: 0, green: 0 };
+  const thiefHomes: Record<Team, number> = {
+    you: 0,
+    red: 0,
+    purple: 0,
+    green: 0,
+  };
+  const homesOf: Record<Team, Tower[]> = {
+    you: [],
+    red: [],
+    purple: [],
+    green: [],
+  };
+  for (const t of g.towers) {
+    byId[t.id] = t;
+    if (t.kind === 'relay' && t.team) relays[t.team]++;
+    if (t.home && t.team) {
+      thiefHomes[t.team]++;
+      if (t.ruinedAt === undefined) homesOf[t.team].push(t);
+    }
+  }
+  const CANNON_CELL = 10;
+  const THIEF_CELL = 1.5;
+  const cannonGrid = new Map<number, number[]>();
+  const thiefGrid = new Map<number, number[]>();
+  for (let i = 0; i < incoming.length; i++) {
+    const p = incoming[i];
+    if (p.delay > 0 || p.strength <= 0) continue;
+    if (p.progress > 0) fillGrid(cannonGrid, i, p.x, p.y, CANNON_CELL);
+    if (!p.cargo && !p.scoutUntil && p.strength >= 3)
+      fillGrid(thiefGrid, i, p.x, p.y, THIEF_CELL);
   }
   for (const t of g.towers) {
     if (
@@ -963,21 +1045,35 @@ export function tick(previous: Game, dt = 0.05): Game {
     )
       continue;
     const gun = cannon(t);
-    const distance = (p: Troop) =>
-      Math.hypot(
-        ((p.x - t.x) * WORLD_WIDTH) / 100,
-        ((p.y - t.y) * WORLD_HEIGHT) / 100,
-      );
-    const target = incoming
-      .filter(
-        (p) =>
-          p.team !== t.team &&
-          p.delay <= 0 &&
-          p.progress > 0 &&
-          p.strength > 0 &&
-          distance(p) <= gun.range,
-      )
-      .sort((a, b) => distance(a) - distance(b))[0];
+    const padX = (gun.range * 100) / WORLD_WIDTH + 1e-4;
+    const padY = (gun.range * 100) / WORLD_HEIGHT + 1e-4;
+    const cx0 = Math.floor((t.x - padX) / CANNON_CELL);
+    const cx1 = Math.floor((t.x + padX) / CANNON_CELL);
+    const cy0 = Math.floor((t.y - padY) / CANNON_CELL);
+    const cy1 = Math.floor((t.y + padY) / CANNON_CELL);
+    let bestI = -1;
+    let bestD = Infinity;
+    for (let cy = cy0; cy <= cy1; cy++) {
+      const row = cy * GRID_STRIDE;
+      for (let cx = cx0; cx <= cx1; cx++) {
+        const bucket = cannonGrid.get(cx + row);
+        if (!bucket) continue;
+        for (let k = 0; k < bucket.length; k++) {
+          const i = bucket[k];
+          const p = incoming[i];
+          if (p.team === t.team) continue;
+          const d = Math.hypot(
+            ((p.x - t.x) * WORLD_WIDTH) / 100,
+            ((p.y - t.y) * WORLD_HEIGHT) / 100,
+          );
+          if (d <= gun.range && (d < bestD || (d === bestD && i < bestI))) {
+            bestD = d;
+            bestI = i;
+          }
+        }
+      }
+    }
+    const target = bestI >= 0 ? incoming[bestI] : undefined;
     if (!target) {
       if (t.idleSince === undefined) {
         t.idleSince = g.age;
@@ -1004,7 +1100,7 @@ export function tick(previous: Game, dt = 0.05): Game {
         : t.aim + Math.max(-270 * dt, Math.min(270 * dt, turn));
     if ((t.shotAt ?? 0) > g.age || Math.abs(turn) > 270 * dt + 5) continue;
     t.shotAt =
-      g.age + gun.interval / Math.max(0.05, modifier(g, t.team, 'cannons'));
+      g.age + gun.interval / Math.max(0.05, mod(t.team, 'cannons'));
     const angle = (t.aim * Math.PI) / 180;
     const sx = t.x + ((Math.cos(angle) * 58) / WORLD_WIDTH) * 100,
       sy =
@@ -1022,12 +1118,18 @@ export function tick(previous: Game, dt = 0.05): Game {
       sy,
       target: target.id,
       damage: gun.damage,
-      duration: Math.max(0.25, distance(target) / 500),
+      duration: Math.max(0.25, bestD / 500),
     });
   }
-  for (const old of incoming) {
-    if (old.strength <= 0) continue;
-    const p = { ...old };
+  const originX = new Float64Array(incoming.length);
+  const originY = new Float64Array(incoming.length);
+  for (let i = 0; i < incoming.length; i++) {
+    originX[i] = incoming[i].x;
+    originY[i] = incoming[i].y;
+  }
+  for (let hi = 0; hi < incoming.length; hi++) {
+    const p = incoming[hi];
+    if (p.strength <= 0) continue;
     if ((g.frozen?.[p.team] ?? 0) > g.age) {
       g.troops.push(p);
       continue;
@@ -1048,7 +1150,7 @@ export function tick(previous: Game, dt = 0.05): Game {
             MOVE_SPEED *
             1.8 *
             g.speed[p.team] *
-            modifier(g, p.team, 'speed')) /
+            mod(p.team, 'speed')) /
             Math.max(1, d),
       );
       p.x = p.sx + (dest.x - p.sx) * p.progress;
@@ -1057,16 +1159,32 @@ export function tick(previous: Game, dt = 0.05): Game {
       continue;
     }
     if (p.haul) {
-      const thief = incoming.find(
-        (a) =>
-          !a.cargo &&
-          !a.scoutUntil &&
-          a.team !== p.team &&
-          a.delay <= 0 &&
-          a.strength >= 3 &&
-          Math.hypot(a.x - p.x, a.y - p.y) < 1.5 &&
-          g.towers.some((t) => t.home && t.team === a.team),
-      );
+      let thief: Troop | undefined;
+      let thiefAt = Infinity;
+      const x0 = Math.floor((p.x - 1.5 - 1e-6) / THIEF_CELL);
+      const x1 = Math.floor((p.x + 1.5 + 1e-6) / THIEF_CELL);
+      const y0 = Math.floor((p.y - 1.5 - 1e-6) / THIEF_CELL);
+      const y1 = Math.floor((p.y + 1.5 + 1e-6) / THIEF_CELL);
+      for (let cy = y0; cy <= y1; cy++) {
+        const row = cy * GRID_STRIDE;
+        for (let cx = x0; cx <= x1; cx++) {
+          const bucket = thiefGrid.get(cx + row);
+          if (!bucket) continue;
+          for (let k = 0; k < bucket.length; k++) {
+            const i = bucket[k];
+            if (i >= thiefAt) continue;
+            const a = incoming[i];
+            if (a.team === p.team || thiefHomes[a.team] <= 0) continue;
+            if (
+              Math.hypot(originX[i] - originX[hi], originY[i] - originY[hi]) <
+              1.5
+            ) {
+              thief = a;
+              thiefAt = i;
+            }
+          }
+        }
+      }
       if (thief && g.age - (p.stolenAt ?? -10) > 5) {
         p.team = thief.team;
         p.stolenAt = g.age;
@@ -1075,21 +1193,14 @@ export function tick(previous: Game, dt = 0.05): Game {
         p.sy = p.y;
         p.speech = 'Караван перехвачен!';
       }
-      const current = g.towers.find((t) => t.id === p.to);
+      const current = byId[p.to];
       const held =
         current &&
         current.home &&
         current.team === p.team &&
         current.ruinedAt === undefined;
       if (!held) {
-        const home = g.towers
-          .filter(
-            (t) => t.home && t.team === p.team && t.ruinedAt === undefined,
-          )
-          .sort(
-            (a, b) =>
-              worldSpan(a.x, a.y, p.x, p.y) - worldSpan(b.x, b.y, p.x, p.y),
-          )[0];
+        const home = nearestHome(homesOf[p.team], p.x, p.y);
         if (!home) continue;
         if (p.to !== home.id) {
           p.to = home.id;
@@ -1099,11 +1210,9 @@ export function tick(previous: Game, dt = 0.05): Game {
         }
       }
     }
-    const target = g.towers.find((t) => t.id === p.to);
+    const target = byId[p.to];
     if (!target || target.ruinedAt !== undefined) continue;
-    const boost = g.towers.some((t) => t.kind === 'relay' && t.team === p.team)
-      ? 1.4
-      : 1;
+    const boost = relays[p.team] > 0 ? 1.4 : 1;
     const span = p.haul
       ? worldSpan(target.x, target.y, p.sx, p.sy)
       : Math.hypot(target.x - p.sx, target.y - p.sy);
@@ -1111,7 +1220,7 @@ export function tick(previous: Game, dt = 0.05): Game {
       ? MOVE_SPEED * ((WORLD_WIDTH + WORLD_HEIGHT) / 200)
       : MOVE_SPEED;
     p.progress +=
-      (dt * pace * boost * g.speed[p.team] * modifier(g, p.team, 'speed')) /
+      (dt * pace * boost * g.speed[p.team] * mod(p.team, 'speed')) /
       Math.max(1, span);
     p.x = p.sx + (target.x - p.sx) * Math.min(1, p.progress);
     p.y = p.sy + (target.y - p.sy) * Math.min(1, p.progress);
@@ -1139,8 +1248,22 @@ export function tick(previous: Game, dt = 0.05): Game {
         ((1 + (target.level - 1) * 0.12) *
           (target.specialty === 'fortress' ? 1.5 : 1));
       if (target.count < 0) {
+        const previousTeam = target.team;
+        const wasHome = !!target.home;
+        const liveHome = wasHome && target.ruinedAt === undefined;
+        const wasRelay = target.kind === 'relay';
+        if (previousTeam && wasHome) thiefHomes[previousTeam]--;
+        if (previousTeam && wasRelay) relays[previousTeam]--;
+        if (liveHome && previousTeam) {
+          const list = homesOf[previousTeam];
+          const at = list.indexOf(target);
+          if (at >= 0) list.splice(at, 1);
+        }
         target.team = p.team;
         if (target.home) target.home = p.team;
+        if (wasHome) thiefHomes[p.team]++;
+        if (wasRelay) relays[p.team]++;
+        if (liveHome) insertById(homesOf[p.team], target);
         target.count = Math.abs(target.count);
         g.flash = target.id;
         if (
@@ -1163,8 +1286,14 @@ export function tick(previous: Game, dt = 0.05): Game {
   for (const route of g.automation) {
     if (route.nextAt > g.age || (g.frozen?.[route.team] ?? 0) > g.age) continue;
     route.nextAt = g.age + 6;
-    const source = g.towers.find((t) => t.id === route.from);
-    const target = g.towers.find((t) => t.id === route.to);
+    const source =
+      g.towers[route.from]?.id === route.from
+        ? g.towers[route.from]
+        : g.towers.find((t) => t.id === route.from);
+    const target =
+      g.towers[route.to]?.id === route.to
+        ? g.towers[route.to]
+        : g.towers.find((t) => t.id === route.to);
     const reserve =
       route.mode === 'excess'
         ? Math.max(route.reserve ?? 5, capacity(source ?? g.towers[0]) * 0.75)
@@ -1199,12 +1328,7 @@ export function tick(previous: Game, dt = 0.05): Game {
       (t.stockGold ?? 0) + (t.stockWood ?? 0) < 5
     )
       continue;
-    const home = g.towers
-      .filter((h) => h.team === t.team && h.home && h.ruinedAt === undefined)
-      .sort(
-        (a, b) =>
-          worldSpan(a.x, a.y, t.x, t.y) - worldSpan(b.x, b.y, t.x, t.y),
-      )[0];
+    const home = nearestHome(homesOf[t.team], t.x, t.y);
     if (!home) continue;
     g.troops.push({
       id: g.nextId++,
@@ -1290,11 +1414,11 @@ export function tick(previous: Game, dt = 0.05): Game {
         !g.troops.some((p) => p.team === team && p.scoutUntil)
       )
         g = sendScout(g, buildings[0].id, 50, 50, team);
+      const threatened = new Set<number>();
+      for (const p of g.troops) if (p.team !== team) threatened.add(p.to);
       const armed = buildings.find(
         (t) =>
-          hasCannon(t) &&
-          (t.gunLevel ?? 1) < 3 &&
-          g.troops.some((p) => p.team !== team && p.to === t.id),
+          hasCannon(t) && (t.gunLevel ?? 1) < 3 && threatened.has(t.id),
       );
       if (armed) {
         const price = cannonCost(armed);
@@ -1379,11 +1503,15 @@ export function tick(previous: Game, dt = 0.05): Game {
     }
   }
   if (g.age >= DEVELOPMENT_SECONDS) {
-    const alive = TEAM_IDS.filter(
-      (team) =>
-        g.towers.some((t) => t.team === team) ||
-        g.troops.some((p) => p.team === team),
-    );
+    const present: Record<Team, boolean> = {
+      you: false,
+      red: false,
+      purple: false,
+      green: false,
+    };
+    for (const t of g.towers) if (t.team) present[t.team] = true;
+    for (const p of g.troops) present[p.team] = true;
+    const alive = TEAM_IDS.filter((team) => present[team]);
     if (alive.length === 1) g.result = alive[0];
   }
   if (g.elapsed >= DURATION - 1e-4 && !g.result)

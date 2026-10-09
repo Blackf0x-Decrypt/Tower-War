@@ -150,6 +150,7 @@ export default function Home() {
   const [clock, setClock] = useState(0);
   const seatRef = useRef(seat);
   if (seat) seatRef.current = seat;
+  const appliedRoomClock = useRef<number | null>(null);
   const sharedRef = useRef(false);
   const meRef = useRef<Team>('you');
   meRef.current = seat?.team ?? 'you';
@@ -163,7 +164,7 @@ export default function Home() {
   const pending = useRef<AbortController | null>(null);
   const spellFlight = useRef<{
     abort: AbortController;
-    start: Promise<{ nonce: number | null; epoch: number | null }>;
+    start: Promise<{ nonce: number | null; epoch: number | null; error?: string }>;
   } | null>(null);
   const [game, setGame] = useState(initialGame);
   const [selected, setSelected] = useState<number | null>(0);
@@ -272,14 +273,17 @@ export default function Home() {
           game: Game | null;
           you: { team: Team; ready: boolean } | null;
           error?: string;
+          clock?: number;
         };
         if (stop || mine !== ticket) return;
+        setRoomError(typeof data.error === 'string' ? data.error : '');
         if (id && seatRef.current?.id === id && !data.you) {
           misses += 1;
           if (misses < 2) return;
           writeSavedSeat(null);
           sharedRef.current = false;
           seatRef.current = null;
+          appliedRoomClock.current = null;
           setSeat(null);
           setResuming(false);
           setStarted(false);
@@ -287,6 +291,12 @@ export default function Home() {
           return;
         }
         misses = 0;
+        if (
+          typeof data.clock === 'number' &&
+          data.clock === appliedRoomClock.current
+        )
+          return;
+        if (typeof data.clock === 'number') appliedRoomClock.current = data.clock;
         setLobby(data);
         if (seatRef.current && data.started && data.game) {
           if (!sharedRef.current) initialized.current = false;
@@ -308,7 +318,7 @@ export default function Home() {
     };
     const arm = () => {
       window.clearTimeout(timer);
-      const delay = document.hidden ? 10000 : seatRef.current ? 200 : 1000;
+      const delay = document.hidden ? 10000 : seatRef.current ? 500 : 1000;
       timer = window.setTimeout(() => {
         void pull().finally(() => {
           if (!stop) arm();
@@ -601,6 +611,7 @@ export default function Home() {
       });
       writeSavedSeat(null);
       seatRef.current = null;
+      appliedRoomClock.current = null;
       setSeat(null);
       setResuming(false);
     }
@@ -678,14 +689,12 @@ export default function Home() {
       }).then((data) => ({
         nonce: typeof data.spellNonce === 'number' ? data.spellNonce : null,
         epoch: typeof data.spellEpoch === 'number' ? data.spellEpoch : null,
+        error: typeof data.error === 'string' ? data.error : undefined,
       }));
     }
-    let next = gameRef.current;
-    setGame((g) => {
-      next = applyPlay(g, actor, action);
-      return next;
-    });
+    const next = applyPlay(gameRef.current, actor, action);
     gameRef.current = next;
+    setGame(next);
     return Promise.resolve({
       nonce: next.spell?.nonce ?? null,
       epoch: next.spell?.epoch ?? null,
@@ -720,6 +729,22 @@ export default function Home() {
         ...g,
         notice: 'Сначала выберите свою башню, затем нажмите на цель.',
       }));
+  };
+  const onTowerClick = (t: Tower) => {
+    if (
+      t.ruinedAt !== undefined ||
+      recording ||
+      paused ||
+      help ||
+      game.result ||
+      suppressClick.current
+    )
+      return;
+    if (source && source.id === t.id) {
+      setSelected(null);
+      return;
+    }
+    clickTower(t);
   };
   async function submitPrompt(e: React.FormEvent) {
     e.preventDefault();
@@ -764,7 +789,9 @@ export default function Home() {
       if (typeof startedSpell?.epoch === 'number') epoch = startedSpell.epoch;
       if (request.signal.aborted) return;
       if (nonce == null) {
-        setPromptMessage('Приказ не начат. Лидерство уже у другого.');
+        setPromptMessage(
+          startedSpell?.error || 'Приказ не начат. Лидерство уже у другого.',
+        );
         return;
       }
       const response = await fetch('/api/decree', {
@@ -931,6 +958,7 @@ export default function Home() {
                       }
                       writeSavedSeat(null);
                       if (seatRef.current?.id === seat.id) seatRef.current = null;
+                      appliedRoomClock.current = null;
                       return sit(id);
                     });
                   }}
@@ -1488,7 +1516,7 @@ export default function Home() {
               {game.towers.map((t) => (
                 <button
                   key={t.id}
-                  onClick={() => clickTower(t)}
+                  onClick={() => onTowerClick(t)}
                   className={`tower team-${t.team ?? 'neutral'} ${source?.id === t.id ? 'selected' : ''} ${t.kind} ${t.ruinedAt !== undefined ? 'ruined' : ''} ${t.ruinedAt !== undefined && game.age - t.ruinedAt < 8 ? 'burning-site' : ''} ${t.home ? 'headquarters' : ''} ${game.flash === t.id ? 'captured' : ''}`}
                   style={
                     {
@@ -2412,7 +2440,7 @@ export default function Home() {
             </p>
           )}
           <p className="prompt-feedback" role="status">
-            {promptMessage}
+            {promptMessage || roomError}
           </p>
           {game.decreeLog[0] && (
             <div className="last-decree">

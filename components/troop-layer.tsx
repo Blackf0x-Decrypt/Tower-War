@@ -3,28 +3,60 @@ import { memo, useEffect, useRef } from 'react';
 import { type Game, WORLD_WIDTH, WORLD_HEIGHT } from '@/lib/tower-game';
 import type { Camera } from '@/lib/camera';
 
+const speechWidth = new Map<string, number>();
+
+function towerAt(towers: Game['towers'], id: number) {
+  const direct = towers[id];
+  if (direct && direct.id === id) return direct;
+  for (let i = 0; i < towers.length; i++) if (towers[i].id === id) return towers[i];
+  return undefined;
+}
+
+function widthOf(ctx: CanvasRenderingContext2D, text: string) {
+  const known = speechWidth.get(text);
+  if (known !== undefined) return known;
+  const width = ctx.measureText(text).width;
+  if (speechWidth.size > 64) speechWidth.clear();
+  speechWidth.set(text, width);
+  return width;
+}
+
 // One drawing surface instead of hundreds of independently animated DOM images.
 export const TroopLayer = memo(function TroopLayer({game, camera, viewport, speech, paused}: {
   game: Game; camera: Camera; viewport: {w:number;h:number}; speech:boolean; paused:boolean;
 }) {
   const canvas = useRef<HTMLCanvasElement>(null);
-  const frame = useRef({game,camera,viewport,speech,paused,at:0,interval:50,previous:new Map<number,{x:number;y:number}>()});
+  const previous = useRef(new Map<number, {x:number;y:number}>());
+  const slots = useRef<{x:number;y:number}[]>([]);
+  const frame = useRef({game,camera,viewport,speech,paused,at:0,interval:50,previous:previous.current});
+  const painted = useRef({x:Number.NaN,y:Number.NaN,z:Number.NaN,w:0,h:0,game:null as Game|null,speech:false,paused:false,hop:-1});
   useEffect(()=> {
     const old=frame.current;
     if (old.game === game) {
-      frame.current={...old,camera,viewport,speech,paused};
+      old.camera=camera; old.viewport=viewport; old.speech=speech; old.paused=paused;
       return;
     }
     const now=performance.now();
-    frame.current={game,camera,viewport,speech,paused,at:now,interval:Math.max(16,Math.min(150,now-old.at)),
-      previous: game.age>=old.game.age && game.age-old.game.age<=.25
-        ? new Map(old.game.troops.map(p=>[p.id,{x:p.x,y:p.y}])) : new Map()};
+    const prev=previous.current;
+    prev.clear();
+    if (game.age>=old.game.age && game.age-old.game.age<=.25) {
+      const troops=old.game.troops, pool=slots.current;
+      for (let i=0;i<troops.length;i++) {
+        const p=troops[i];
+        let slot=pool[i];
+        if (!slot) pool[i]=slot={x:0,y:0};
+        slot.x=p.x; slot.y=p.y;
+        prev.set(p.id, slot);
+      }
+    }
+    frame.current={game,camera,viewport,speech,paused,at:now,interval:Math.max(16,Math.min(150,now-old.at)),previous:prev};
   },[game,camera,viewport,speech,paused]);
   useEffect(()=> {
     let id=0,disposed=false;
     const reducedMotion=window.matchMedia('(prefers-reduced-motion: reduce)');
     const source=new Image();
     const sprites:Record<string,HTMLCanvasElement>={};
+    const dash=[10,8];
     source.onload=()=> {
       const hue: Record<string, number | null> = {you:null, red:0.01, purple:0.76, green:0.36};
       for(const team of Object.keys(hue)) {
@@ -72,78 +104,93 @@ export const TroopLayer = memo(function TroopLayer({game, camera, viewport, spee
       if(el) {
         const ratio=Math.min(window.devicePixelRatio||1,1.5), zoom=f.camera.zoom;
         const width=Math.max(1,Math.round(f.viewport.w*ratio)),height=Math.max(1,Math.round(f.viewport.h*ratio));
-        if(el.width!==width||el.height!==height){el.width=width;el.height=height;}
-        const ctx=el.getContext('2d');
-        if(ctx){
-          ctx.setTransform(ratio,0,0,ratio,0,0);ctx.clearRect(0,0,f.viewport.w,f.viewport.h);
-          const blend=f.paused?1:Math.min(1,(now-f.at)/f.interval);
-          const motion=f.paused?f.game.age:now/1000;
-          const spot=(px:number,py:number)=>({
-            x:px/100*WORLD_WIDTH*zoom+f.camera.x,
-            y:py/100*WORLD_HEIGHT*zoom+f.camera.y,
-          });
-          ctx.save();
-          ctx.lineCap='round';
-          for(const p of f.game.troops){
-            if(!p.cargo||p.delay>0)continue;
-            const a=f.game.towers.find(t=>t.id===p.from), b=f.game.towers.find(t=>t.id===p.to);
-            if(!a||!b)continue;
-            const s=spot(a.x,a.y), e=spot(b.x,b.y);
-            ctx.strokeStyle='#c4a15a99';ctx.lineWidth=3*zoom;ctx.setLineDash([10*zoom,8*zoom]);
-            ctx.beginPath();ctx.moveTo(s.x,s.y);ctx.lineTo(e.x,e.y);ctx.stroke();
+        const blend=f.paused?1:Math.min(1,(now-f.at)/f.interval);
+        const moving=blend<1 && !f.paused;
+        const mark=painted.current;
+        const same=f.camera.x===mark.x && f.camera.y===mark.y && zoom===mark.z && f.viewport.w===mark.w && f.viewport.h===mark.h && f.game===mark.game && f.speech===mark.speech && f.paused===mark.paused && el.width===width && el.height===height;
+        let paint=true;
+        if(same && !moving) {
+          if(f.paused || reducedMotion.matches) paint=false;
+          else {
+            const hop=(now/32)|0;
+            if(hop===mark.hop) paint=false;
           }
-          ctx.restore();
-          for(const p of f.game.troops){
-            if(p.delay>0)continue;
-            const old=f.previous.get(p.id)??p;
-            const x=(old.x+(p.x-old.x)*blend)/100*WORLD_WIDTH*zoom+f.camera.x;
-            const y=(old.y+(p.y-old.y)*blend)/100*WORLD_HEIGHT*zoom+f.camera.y;
-            if(x < -100 || y < -100 || x>f.viewport.w+100 || y>f.viewport.h+100)continue;
-            ctx.save();ctx.translate(x,y);ctx.scale(zoom,zoom);
-            if(!p.cargo){
-              const dest=f.game.towers[p.to];
-              const dx=dest?((dest.x-p.sx)/100)*WORLD_WIDTH:1;
-              const dy=dest?((dest.y-p.sy)/100)*WORLD_HEIGHT:0;
-              const len=Math.hypot(dx,dy)||1;
-              const slot=(p.id%5)-2;
-              ctx.translate((-dy/len)*slot*16,(dx/len)*slot*16);
-            }
-            ctx.fillStyle='#3b572d38';ctx.beginPath();ctx.ellipse(0,0,11,4,0,0,Math.PI*2);ctx.fill();
-            if(p.cargo){
-              const spin=reducedMotion.matches?p.id:motion*8+p.id*1.7;
-              const bob=reducedMotion.matches?0:Math.sin(motion*5+p.id*1.3)*3;
-              ctx.translate(0,-8+bob);
-              const wheel=(wx:number)=>{
-                ctx.save();ctx.translate(wx,9);ctx.rotate(spin);
-                ctx.fillStyle='#2c2c2c';ctx.beginPath();ctx.arc(0,0,4.4,0,Math.PI*2);ctx.fill();
-                ctx.strokeStyle='#f4f4f4';ctx.lineWidth=1.4;
-                ctx.beginPath();ctx.moveTo(-3.2,0);ctx.lineTo(3.2,0);ctx.moveTo(0,-3.2);ctx.lineTo(0,3.2);ctx.stroke();
-                ctx.restore();
-              };
-              wheel(-10);wheel(10);
-              ctx.fillStyle='#8a552c';ctx.strokeStyle='#5c3818';ctx.lineWidth=1.5;
-              ctx.beginPath();ctx.roundRect(-16,-8,32,16,3);ctx.fill();ctx.stroke();
-              ctx.fillStyle=p.haul?.resources&&!p.haul.gold?'#6fa84a':'#f0c14a';
-              ctx.beginPath();ctx.moveTo(-11,-8);ctx.lineTo(-4,-18);ctx.lineTo(3,-8);ctx.fill();
-              ctx.beginPath();ctx.moveTo(-2,-8);ctx.lineTo(5,-17);ctx.lineTo(12,-8);ctx.fill();
-              ctx.font='bold 12px Arial';ctx.textAlign='center';ctx.fillStyle='#fff';ctx.strokeStyle='#805025';ctx.lineWidth=3;
-              const text=p.haul?String(Math.floor(p.haul.gold+p.haul.resources)):`+${p.strength}`;
-              ctx.strokeText(text,0,-24);ctx.fillText(text,0,-24);
-            }else if(sprites[p.team]){
-              const hop=reducedMotion.matches?0:Math.abs(Math.sin(motion*7+p.id*1.7))*8;
-              ctx.save();ctx.translate(0,-18-hop);
-              const face = p.waypoint?.x ?? f.game.towers[p.to]?.x;
-              if (face !== undefined && face < p.sx) ctx.scale(-1, 1);
-              ctx.rotate(reducedMotion.matches?0:Math.sin(motion*7+p.id*1.7)*.12);
-              ctx.drawImage(sprites[p.team],-19,-24,38,48);ctx.restore();
-              if(p.scoutUntil||p.elite){ctx.fillStyle='#fff1a2';ctx.font='bold 14px Arial';ctx.fillText(p.elite?'★':'◉',-6,-46);}
-            }
-            if(f.speech&&!f.game.hideMessages&&p.speech&&p.progress>.07&&p.progress<.8){
-              ctx.font='12px Arial';ctx.textAlign='center';const w=ctx.measureText(p.speech).width+16;
-              ctx.fillStyle='#fff';ctx.beginPath();ctx.roundRect(-w/2,-68,w,23,7);ctx.fill();
-              ctx.fillStyle='#3b4937';ctx.fillText(p.speech,0,-52);
+        }
+        if(paint) {
+          if(el.width!==width||el.height!==height){el.width=width;el.height=height;}
+          const ctx=el.getContext('2d');
+          if(ctx){
+            ctx.setTransform(ratio,0,0,ratio,0,0);ctx.clearRect(0,0,f.viewport.w,f.viewport.h);
+            const motion=f.paused?f.game.age:now/1000;
+            const towers=f.game.towers;
+            ctx.save();
+            ctx.lineCap='round';
+            dash[0]=10*zoom; dash[1]=8*zoom;
+            ctx.setLineDash(dash);
+            ctx.strokeStyle='#c4a15a99'; ctx.lineWidth=3*zoom;
+            for(const p of f.game.troops){
+              if(!p.cargo||p.delay>0)continue;
+              const a=towerAt(towers,p.from), b=towerAt(towers,p.to);
+              if(!a||!b)continue;
+              const sx=a.x/100*WORLD_WIDTH*zoom+f.camera.x, sy=a.y/100*WORLD_HEIGHT*zoom+f.camera.y;
+              const ex=b.x/100*WORLD_WIDTH*zoom+f.camera.x, ey=b.y/100*WORLD_HEIGHT*zoom+f.camera.y;
+              ctx.beginPath();ctx.moveTo(sx,sy);ctx.lineTo(ex,ey);ctx.stroke();
             }
             ctx.restore();
+            const drawWheel=(wx:number,spin:number)=>{
+              ctx.save();ctx.translate(wx,9);ctx.rotate(spin);
+              ctx.fillStyle='#2c2c2c';ctx.beginPath();ctx.arc(0,0,4.4,0,Math.PI*2);ctx.fill();
+              ctx.strokeStyle='#f4f4f4';ctx.lineWidth=1.4;
+              ctx.beginPath();ctx.moveTo(-3.2,0);ctx.lineTo(3.2,0);ctx.moveTo(0,-3.2);ctx.lineTo(0,3.2);ctx.stroke();
+              ctx.restore();
+            };
+            for(const p of f.game.troops){
+              if(p.delay>0)continue;
+              const old=f.previous.get(p.id)??p;
+              const x=(old.x+(p.x-old.x)*blend)/100*WORLD_WIDTH*zoom+f.camera.x;
+              const y=(old.y+(p.y-old.y)*blend)/100*WORLD_HEIGHT*zoom+f.camera.y;
+              if(x < -100 || y < -100 || x>f.viewport.w+100 || y>f.viewport.h+100)continue;
+              ctx.save();ctx.translate(x,y);ctx.scale(zoom,zoom);
+              if(!p.cargo){
+                const dest=towerAt(towers,p.to);
+                const dx=dest?((dest.x-p.sx)/100)*WORLD_WIDTH:1;
+                const dy=dest?((dest.y-p.sy)/100)*WORLD_HEIGHT:0;
+                const len=Math.hypot(dx,dy)||1;
+                const slot=(p.id%5)-2;
+                ctx.translate((-dy/len)*slot*16,(dx/len)*slot*16);
+              }
+              ctx.fillStyle='#3b572d38';ctx.beginPath();ctx.ellipse(0,0,11,4,0,0,Math.PI*2);ctx.fill();
+              if(p.cargo){
+                const spin=reducedMotion.matches?p.id:motion*8+p.id*1.7;
+                const bob=reducedMotion.matches?0:Math.sin(motion*5+p.id*1.3)*3;
+                ctx.translate(0,-8+bob);
+                drawWheel(-10,spin);drawWheel(10,spin);
+                ctx.fillStyle='#8a552c';ctx.strokeStyle='#5c3818';ctx.lineWidth=1.5;
+                ctx.beginPath();ctx.roundRect(-16,-8,32,16,3);ctx.fill();ctx.stroke();
+                ctx.fillStyle=p.haul?.resources&&!p.haul.gold?'#6fa84a':'#f0c14a';
+                ctx.beginPath();ctx.moveTo(-11,-8);ctx.lineTo(-4,-18);ctx.lineTo(3,-8);ctx.fill();
+                ctx.beginPath();ctx.moveTo(-2,-8);ctx.lineTo(5,-17);ctx.lineTo(12,-8);ctx.fill();
+                ctx.font='bold 12px Arial';ctx.textAlign='center';ctx.fillStyle='#fff';ctx.strokeStyle='#805025';ctx.lineWidth=3;
+                const text=p.haul?String(Math.floor(p.haul.gold+p.haul.resources)):`+${p.strength}`;
+                ctx.strokeText(text,0,-24);ctx.fillText(text,0,-24);
+              }else if(sprites[p.team]){
+                const hop=reducedMotion.matches?0:Math.abs(Math.sin(motion*7+p.id*1.7))*8;
+                ctx.save();ctx.translate(0,-18-hop);
+                const face = p.waypoint?.x ?? towerAt(towers,p.to)?.x;
+                if (face !== undefined && face < p.sx) ctx.scale(-1, 1);
+                ctx.rotate(reducedMotion.matches?0:Math.sin(motion*7+p.id*1.7)*.12);
+                ctx.drawImage(sprites[p.team],-19,-24,38,48);ctx.restore();
+                if(p.scoutUntil||p.elite){ctx.fillStyle='#fff1a2';ctx.font='bold 14px Arial';ctx.fillText(p.elite?'★':'◉',-6,-46);}
+              }
+              if(f.speech&&!f.game.hideMessages&&p.speech&&p.progress>.07&&p.progress<.8){
+                ctx.font='12px Arial';ctx.textAlign='center';const w=widthOf(ctx,p.speech)+16;
+                ctx.fillStyle='#fff';ctx.beginPath();ctx.roundRect(-w/2,-68,w,23,7);ctx.fill();
+                ctx.fillStyle='#3b4937';ctx.fillText(p.speech,0,-52);
+              }
+              ctx.restore();
+            }
+            mark.x=f.camera.x; mark.y=f.camera.y; mark.z=zoom; mark.w=f.viewport.w; mark.h=f.viewport.h;
+            mark.game=f.game; mark.speech=f.speech; mark.paused=f.paused; mark.hop=(now/32)|0;
           }
         }
       }

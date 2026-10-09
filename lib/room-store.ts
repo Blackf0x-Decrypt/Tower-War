@@ -13,6 +13,8 @@ export const REDIS_ENV_PAIRS = [
   ['UPSTASH_REDIS_REST_URL', 'UPSTASH_REDIS_REST_TOKEN'],
   ['STORAGE_REDIS_REST_URL', 'STORAGE_REDIS_REST_TOKEN'],
   ['STORAGE_UPSTASH_REDIS_REST_URL', 'STORAGE_UPSTASH_REDIS_REST_TOKEN'],
+  ['STORAGE_KV_REST_API_URL', 'STORAGE_KV_REST_API_TOKEN'],
+  ['STORAGE_REST_API_URL', 'STORAGE_REST_API_TOKEN'],
   ['STORAGE_URL', 'STORAGE_TOKEN'],
   ['KV_REST_API_URL', 'KV_REST_API_TOKEN'],
 ] as const;
@@ -36,6 +38,24 @@ export class RoomBusyError extends Error {
     super('Комната занята другим ходом. Повторите.');
     this.name = 'RoomBusyError';
   }
+}
+
+export class RedisRequestError extends Error {
+  readonly status: number;
+  readonly reason: string;
+  constructor(status: number, reason: string) {
+    super(reason);
+    this.name = 'RedisRequestError';
+    this.status = status;
+    this.reason = reason;
+  }
+}
+
+function publicReason(value: string) {
+  return value
+    .replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
+    .replace(/(token|password|secret)[=:]\s*\S+/gi, '$1=[redacted]')
+    .slice(0, 180);
 }
 
 export type Kv = {
@@ -95,20 +115,38 @@ export function sharedMemoryKv(): Kv {
 
 async function redisCall(command: (string | number)[]): Promise<unknown> {
   const creds = redisCredentials();
-  if (!creds) throw new Error('redis env missing');
+  if (!creds) throw new RedisRequestError(0, 'redis env missing');
   const { url, token } = creds;
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(command),
-    cache: 'no-store',
-  });
-  if (!response.ok) throw new Error(`redis http ${response.status}`);
-  const payload = (await response.json()) as { result?: unknown; error?: string };
-  if (payload.error) throw new Error('redis command failed');
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(command),
+      cache: 'no-store',
+    });
+  } catch {
+    throw new RedisRequestError(0, 'fetch failed');
+  }
+  const text = await response.text();
+  let payload: { result?: unknown; error?: unknown } = {};
+  if (text) {
+    try {
+      payload = JSON.parse(text) as { result?: unknown; error?: unknown };
+    } catch {
+      throw new RedisRequestError(response.status || 502, `http ${response.status}`);
+    }
+  }
+  if (!response.ok || payload.error != null) {
+    const reason =
+      typeof payload.error === 'string' && payload.error
+        ? publicReason(payload.error)
+        : `http ${response.status}`;
+    throw new RedisRequestError(response.status, reason);
+  }
   return payload.result ?? null;
 }
 
@@ -158,13 +196,17 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export async function withLock<T>(kv: Kv, fn: () => Promise<T>): Promise<T> {
+export async function withLock<T>(
+  kv: Kv,
+  fn: () => Promise<T>,
+  attempts = LOCK_ATTEMPTS,
+): Promise<T> {
   const token = crypto.randomUUID();
   let held = false;
-  for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt++) {
+  for (let attempt = 0; attempt < attempts; attempt++) {
     held = await kv.setNxPx(LOCK_KEY, token, LOCK_PX);
     if (held) break;
-    await sleep(LOCK_WAIT_MS);
+    if (attempt + 1 < attempts) await sleep(LOCK_WAIT_MS);
   }
   if (!held) throw new RoomBusyError();
   try {
@@ -182,13 +224,18 @@ export async function lockedUpdate<T>(
   kv: Kv,
   key: string,
   fn: (raw: string | null) => { json: string; result: T } | Promise<{ json: string; result: T }>,
+  attempts = LOCK_ATTEMPTS,
 ): Promise<T> {
-  return withLock(kv, async () => {
-    const raw = await kv.get(key);
-    const next = await fn(raw);
-    await kv.set(key, next.json);
-    return next.result;
-  });
+  return withLock(
+    kv,
+    async () => {
+      const raw = await kv.get(key);
+      const next = await fn(raw);
+      await kv.set(key, next.json);
+      return next.result;
+    },
+    attempts,
+  );
 }
 
 export function capJson(json: string, trim: (parsed: unknown) => unknown): string {

@@ -3,6 +3,8 @@ import { initialGame, tick, TEAM_IDS, type Game, type Team } from './tower-game'
 import {
   REDIS_MISSING_ERROR,
   ROOM_KEY,
+  RedisRequestError,
+  RoomBusyError,
   capJson,
   lockedUpdate,
   resolveKv,
@@ -42,6 +44,7 @@ export type RoomView = {
   ok?: boolean;
   spellNonce?: number | null;
   spellEpoch?: number | null;
+  clock?: number;
 };
 
 export function blankRoom(now = Date.now()): Room {
@@ -190,6 +193,7 @@ function viewOf(current: Room, playerId: string | null): RoomView {
     startAt: current.started ? null : current.startAt,
     game: current.started ? current.game : null,
     you: seat ? { team: seat.team, ready: seat.ready } : null,
+    clock: current.clock,
   };
 }
 
@@ -197,24 +201,43 @@ function missingRoom(): RoomView {
   return { error: REDIS_MISSING_ERROR, code: 'redis_missing' };
 }
 
-async function editRoom<T>(fn: (room: Room, now: number) => T): Promise<T> {
+async function editRoom<T>(
+  fn: (room: Room, now: number) => T,
+  attempts?: number,
+): Promise<T> {
   const kv = resolveKv();
-  if (kv === 'missing') throw new Error('redis missing');
-  return lockedUpdate(kv, ROOM_KEY, (raw) => {
-    const now = Date.now();
-    const room = raw ? roomFromJson(raw) : blankRoom(now);
-    const result = fn(room, now);
-    return { json: roomToJson(room), result };
+  if (kv === 'missing') throw new RedisRequestError(0, 'redis env missing');
+  return lockedUpdate(
+    kv,
+    ROOM_KEY,
+    (raw) => {
+      const now = Date.now();
+      const room = raw ? roomFromJson(raw) : blankRoom(now);
+      const result = fn(room, now);
+      return { json: roomToJson(room), result };
+    },
+    attempts,
+  );
+}
+
+function storedView(kv: Kv, playerId: string | null): Promise<RoomView> {
+  return kv.get(ROOM_KEY).then((raw) => {
+    return viewOf(raw ? roomFromJson(raw) : blankRoom(), playerId);
   });
 }
 
 export async function roomView(playerId: string | null): Promise<RoomView> {
   const kv = resolveKv();
   if (kv === 'missing') return missingRoom();
-  return editRoom((current, now) => {
-    prepare(current, playerId, now);
-    return viewOf(current, playerId);
-  });
+  try {
+    return await editRoom((current, now) => {
+      prepare(current, playerId, now);
+      return viewOf(current, playerId);
+    }, 1);
+  } catch (error) {
+    if (!(error instanceof RoomBusyError)) throw error;
+    return storedView(kv, playerId);
+  }
 }
 
 function isTeam(value: unknown): value is Team {

@@ -1,4 +1,4 @@
-import { RoomBusyError } from '@/lib/room-store';
+import { REDIS_MISSING_ERROR, RedisRequestError, RoomBusyError } from '@/lib/room-store';
 import { roomCommand, roomView, type RoomView } from '@/lib/room';
 
 function json(body: unknown, status = 200) {
@@ -14,17 +14,44 @@ function statusFor(result: RoomView) {
   return 200;
 }
 
+function failure(error: unknown) {
+  if (error instanceof RoomBusyError) {
+    console.error('room busy');
+    return json({ error: error.message, code: 'room_busy' }, 503);
+  }
+  if (error instanceof RedisRequestError) {
+    if (error.reason === 'redis env missing') {
+      console.error('room redis missing');
+      return json({ error: REDIS_MISSING_ERROR, code: 'redis_missing' }, 503);
+    }
+    console.error(`room redis ${error.status} ${error.reason}`);
+    return json(
+      {
+        error: 'Redis не ответил. Общая комната недоступна.',
+        code: 'redis_error',
+        status: error.status,
+        reason: error.reason,
+      },
+      503,
+    );
+  }
+  console.error('room failed');
+  return json(
+    {
+      error: 'Комната временно недоступна. Обновите страницу.',
+      code: 'room_error',
+    },
+    503,
+  );
+}
+
 export async function GET(request: Request) {
   const player = new URL(request.url).searchParams.get('player');
   try {
     const view = await roomView(player);
     return json(view, statusFor(view));
   } catch (error) {
-    const message =
-      error instanceof RoomBusyError
-        ? error.message
-        : 'Комната временно недоступна. Обновите страницу.';
-    return json({ error: message }, { status: 503 });
+    return failure(error);
   }
 }
 
@@ -39,10 +66,6 @@ export async function POST(request: Request) {
     const result = await roomCommand(body);
     return json(result, statusFor(result));
   } catch (error) {
-    const message =
-      error instanceof RoomBusyError
-        ? error.message
-        : 'Комната временно недоступна. Обновите страницу.';
-    return json({ error: message }, { status: 503 });
+    return failure(error);
   }
 }
