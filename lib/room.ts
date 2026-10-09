@@ -26,6 +26,7 @@ export type Room = {
   game: Game;
   clock: number;
   startAt: number | null;
+  revision: number;
 };
 
 const STALE_MS = 120_000;
@@ -45,6 +46,7 @@ export type RoomView = {
   spellNonce?: number | null;
   spellEpoch?: number | null;
   clock?: number;
+  revision?: number;
 };
 
 export function blankRoom(now = Date.now()): Room {
@@ -55,6 +57,7 @@ export function blankRoom(now = Date.now()): Room {
     game: initialGame(),
     clock: now,
     startAt: null,
+    revision: 0,
   };
 }
 
@@ -68,7 +71,6 @@ function capStored(parsed: unknown): unknown {
       ...game,
       shots: game.shots?.slice(-8),
       explosions: game.explosions?.slice(-8),
-      troops: game.troops.slice(-80),
       notice: String(game.notice || '').slice(0, 160),
     },
   };
@@ -101,6 +103,7 @@ export function roomFromJson(raw: string): Room {
     throw new Error('bad room json');
   }
   if (data.startAt != null && !Number.isFinite(data.startAt)) data.startAt = null;
+  if (!Number.isSafeInteger(data.revision) || data.revision < 0) data.revision = 0;
   return data;
 }
 
@@ -194,7 +197,18 @@ function viewOf(current: Room, playerId: string | null): RoomView {
     game: current.started ? current.game : null,
     you: seat ? { team: seat.team, ready: seat.ready } : null,
     clock: current.clock,
+    revision: current.revision,
   };
+}
+
+function publicState(room: Room) {
+  return JSON.stringify({
+    seats: room.seats.map(({ name, team, ready }) => ({ name, team, ready })),
+    started: room.started,
+    paused: room.paused,
+    startAt: room.startAt,
+    game: room.started ? room.game : null,
+  });
 }
 
 function missingRoom(): RoomView {
@@ -213,7 +227,11 @@ async function editRoom<T>(
     (raw) => {
       const now = Date.now();
       const room = raw ? roomFromJson(raw) : blankRoom(now);
+      const before = publicState(room);
       const result = fn(room, now);
+      if (publicState(room) !== before) room.revision += 1;
+      if (result && typeof result === 'object' && 'revision' in result)
+        (result as { revision?: number }).revision = room.revision;
       return { json: roomToJson(room), result };
     },
     attempts,

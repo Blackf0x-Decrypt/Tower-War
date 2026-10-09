@@ -39,6 +39,11 @@ import { validDecree } from '@/lib/decrees';
 import { validDebuff } from '@/lib/magic';
 import { applyPlay, type PlayAction } from '@/lib/play';
 import {
+  applyRoomTransport,
+  type AppliedRoom,
+  type RoomTransport,
+} from '@/lib/room-protocol';
+import {
   DURATION,
   DEVELOPMENT_SECONDS,
   WORLD_WIDTH,
@@ -150,7 +155,7 @@ export default function Home() {
   const [clock, setClock] = useState(0);
   const seatRef = useRef(seat);
   if (seat) seatRef.current = seat;
-  const appliedRoomClock = useRef<number | null>(null);
+  const transportRef = useRef<AppliedRoom | null>(null);
   const sharedRef = useRef(false);
   const meRef = useRef<Team>('you');
   meRef.current = seat?.team ?? 'you';
@@ -254,8 +259,12 @@ export default function Home() {
       const id = seatRef.current?.id;
       const mine = ++ticket;
       try {
+        const cursor = transportRef.current?.cursor;
+        const query = new URLSearchParams();
+        if (id) query.set('player', id);
+        if (cursor) query.set('cursor', cursor);
         const response = await fetch(
-          '/api/room' + (id ? `?player=${encodeURIComponent(id)}` : ''),
+          '/api/room' + (query.size ? `?${query}` : ''),
           { cache: 'no-store' },
         );
         if (!response.ok) {
@@ -265,25 +274,23 @@ export default function Home() {
           } catch {}
           return;
         }
-        const data = (await response.json()) as {
-          seats: { name: string; team: Team; ready: boolean }[];
-          started: boolean;
-          paused: boolean;
-          startAt: number | null;
-          game: Game | null;
-          you: { team: Team; ready: boolean } | null;
-          error?: string;
-          clock?: number;
-        };
+        const message = (await response.json()) as RoomTransport;
         if (stop || mine !== ticket) return;
-        setRoomError(typeof data.error === 'string' ? data.error : '');
+        const data = applyRoomTransport(transportRef.current, message);
+        if (!data) {
+          transportRef.current = null;
+          return;
+        }
+        transportRef.current = data;
+        setRoomError('');
+        if (message.transport === 'noop') return;
         if (id && seatRef.current?.id === id && !data.you) {
           misses += 1;
           if (misses < 2) return;
           writeSavedSeat(null);
           sharedRef.current = false;
           seatRef.current = null;
-          appliedRoomClock.current = null;
+          transportRef.current = null;
           setSeat(null);
           setResuming(false);
           setStarted(false);
@@ -291,12 +298,6 @@ export default function Home() {
           return;
         }
         misses = 0;
-        if (
-          typeof data.clock === 'number' &&
-          data.clock === appliedRoomClock.current
-        )
-          return;
-        if (typeof data.clock === 'number') appliedRoomClock.current = data.clock;
         setLobby(data);
         if (seatRef.current && data.started && data.game) {
           if (!sharedRef.current) initialized.current = false;
@@ -611,7 +612,7 @@ export default function Home() {
       });
       writeSavedSeat(null);
       seatRef.current = null;
-      appliedRoomClock.current = null;
+      transportRef.current = null;
       setSeat(null);
       setResuming(false);
     }
@@ -666,6 +667,7 @@ export default function Home() {
     }
     const next = { id: data.playerId, team: data.team };
     const name = callName.trim().slice(0, 16) || 'Игрок';
+    transportRef.current = null;
     seatRef.current = next;
     meRef.current = data.team;
     setSeat(next);
@@ -958,7 +960,7 @@ export default function Home() {
                       }
                       writeSavedSeat(null);
                       if (seatRef.current?.id === seat.id) seatRef.current = null;
-                      appliedRoomClock.current = null;
+                      transportRef.current = null;
                       return sit(id);
                     });
                   }}

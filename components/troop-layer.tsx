@@ -26,6 +26,7 @@ export const TroopLayer = memo(function TroopLayer({game, camera, viewport, spee
   game: Game; camera: Camera; viewport: {w:number;h:number}; speech:boolean; paused:boolean;
 }) {
   const canvas = useRef<HTMLCanvasElement>(null);
+  const wake = useRef<() => void>(() => {});
   const previous = useRef(new Map<number, {x:number;y:number}>());
   const slots = useRef<{x:number;y:number}[]>([]);
   const frame = useRef({game,camera,viewport,speech,paused,at:0,interval:50,previous:previous.current});
@@ -34,6 +35,7 @@ export const TroopLayer = memo(function TroopLayer({game, camera, viewport, spee
     const old=frame.current;
     if (old.game === game) {
       old.camera=camera; old.viewport=viewport; old.speech=speech; old.paused=paused;
+      wake.current();
       return;
     }
     const now=performance.now();
@@ -50,9 +52,10 @@ export const TroopLayer = memo(function TroopLayer({game, camera, viewport, spee
       }
     }
     frame.current={game,camera,viewport,speech,paused,at:now,interval:Math.max(16,Math.min(150,now-old.at)),previous:prev};
+    wake.current();
   },[game,camera,viewport,speech,paused]);
   useEffect(()=> {
-    let id=0,disposed=false;
+    let id=0,disposed=false,lastPaint=0;
     const reducedMotion=window.matchMedia('(prefers-reduced-motion: reduce)');
     const source=new Image();
     const sprites:Record<string,HTMLCanvasElement>={};
@@ -96,9 +99,11 @@ export const TroopLayer = memo(function TroopLayer({game, camera, viewport, spee
         }
         sprites[team]=tile;
       }
+      schedule();
     };
     source.src='/assets/soldier.png';
     const draw=(now:number)=> {
+      id=0;
       if(disposed)return;
       const el=canvas.current, f=frame.current;
       if(el) {
@@ -108,15 +113,18 @@ export const TroopLayer = memo(function TroopLayer({game, camera, viewport, spee
         const moving=blend<1 && !f.paused;
         const mark=painted.current;
         const same=f.camera.x===mark.x && f.camera.y===mark.y && zoom===mark.z && f.viewport.w===mark.w && f.viewport.h===mark.h && f.game===mark.game && f.speech===mark.speech && f.paused===mark.paused && el.width===width && el.height===height;
+        const animated=!f.paused && !reducedMotion.matches && f.game.troops.some(p=>p.delay<=0);
         let paint=true;
         if(same && !moving) {
-          if(f.paused || reducedMotion.matches) paint=false;
+          if(!animated) paint=false;
           else {
             const hop=(now/32)|0;
             if(hop===mark.hop) paint=false;
           }
         }
+        if(paint && animated && now-lastPaint<32) paint=false;
         if(paint) {
+          lastPaint=now;
           if(el.width!==width||el.height!==height){el.width=width;el.height=height;}
           const ctx=el.getContext('2d');
           if(ctx){
@@ -128,8 +136,12 @@ export const TroopLayer = memo(function TroopLayer({game, camera, viewport, spee
             dash[0]=10*zoom; dash[1]=8*zoom;
             ctx.setLineDash(dash);
             ctx.strokeStyle='#c4a15a99'; ctx.lineWidth=3*zoom;
+            const cargoRoutes=new Set<string>();
             for(const p of f.game.troops){
               if(!p.cargo||p.delay>0)continue;
+              const routeKey=`${p.from}:${p.to}`;
+              if(cargoRoutes.has(routeKey))continue;
+              cargoRoutes.add(routeKey);
               const a=towerAt(towers,p.from), b=towerAt(towers,p.to);
               if(!a||!b)continue;
               const sx=a.x/100*WORLD_WIDTH*zoom+f.camera.x, sy=a.y/100*WORLD_HEIGHT*zoom+f.camera.y;
@@ -193,11 +205,20 @@ export const TroopLayer = memo(function TroopLayer({game, camera, viewport, spee
             mark.game=f.game; mark.speech=f.speech; mark.paused=f.paused; mark.hop=(now/32)|0;
           }
         }
+        if(moving||animated)schedule();
       }
-      id=requestAnimationFrame(draw);
     };
-    id=requestAnimationFrame(draw);
-    return()=>{disposed=true;cancelAnimationFrame(id);source.onload=null;};
+    const schedule=()=>{if(!disposed&&!id)id=requestAnimationFrame(draw);};
+    wake.current=schedule;
+    reducedMotion.addEventListener('change',schedule);
+    schedule();
+    return()=>{
+      disposed=true;
+      wake.current=()=>{};
+      cancelAnimationFrame(id);
+      reducedMotion.removeEventListener('change',schedule);
+      source.onload=null;
+    };
   },[]);
   return <canvas ref={canvas} className="troop-canvas" aria-hidden="true"/>;
 });

@@ -19,6 +19,10 @@ import {
   storeMode,
   withLock,
 } from './room-store';
+import {
+  applyRoomTransport,
+  makeRoomTransport,
+} from './room-protocol';
 
 const REDIS_ENV_NAMES = REDIS_ENV_PAIRS.flat();
 
@@ -64,6 +68,113 @@ describe('room store', { concurrency: 1 }, () => {
     const again = await roomView(joined.playerId!);
     assert.equal(again.you?.team, 'you');
     assert.equal(again.seats[0].name, 'Анна');
+  });
+
+  test('room transport applies full then compact delta', () => {
+    const room = blankRoom(1000);
+    room.started = true;
+    room.revision = 1;
+    room.seats = [
+      { id: 'seat-1', name: 'Анна', team: 'you', seen: 1000, ready: false },
+    ];
+    const full = makeRoomTransport(
+      {
+        seats: [{ name: 'Анна', team: 'you', ready: false }],
+        started: true,
+        paused: false,
+        startAt: null,
+        game: room.game,
+        you: { team: 'you', ready: false },
+        revision: 1,
+      },
+      null,
+    );
+    assert.equal(full.transport, 'full');
+    const applied = applyRoomTransport(null, full);
+    assert.ok(applied?.game);
+
+    const nextGame = {
+      ...room.game,
+      age: 0.05,
+      elapsed: 0.05,
+      notice: 'changed',
+    };
+    const delta = makeRoomTransport(
+      {
+        seats: [{ name: 'Анна', team: 'you', ready: false }],
+        started: true,
+        paused: false,
+        startAt: null,
+        game: nextGame,
+        you: { team: 'you', ready: false },
+        revision: 2,
+      },
+      applied!.cursor,
+    );
+    assert.equal(delta.transport, 'delta');
+    if (delta.transport !== 'delta') return;
+    assert.deepEqual(Object.keys(delta.game ?? {}).sort(), [
+      'age',
+      'elapsed',
+      'notice',
+    ]);
+    const updated = applyRoomTransport(applied, delta);
+    assert.equal(updated?.game?.notice, 'changed');
+    assert.strictEqual(updated?.game?.towers, applied?.game?.towers);
+  });
+
+  test('stale out-of-order delta requests a full resync', () => {
+    const view = {
+      seats: [] as { name: string; team: 'you'; ready: boolean }[],
+      started: false,
+      paused: false,
+      startAt: null,
+      game: null,
+      you: null,
+      revision: 1,
+    };
+    const first = applyRoomTransport(null, makeRoomTransport(view, null));
+    assert.ok(first);
+    const secondMessage = makeRoomTransport(
+      { ...view, paused: true, revision: 2 },
+      first!.cursor,
+    );
+    const second = applyRoomTransport(first, secondMessage);
+    assert.ok(second);
+    assert.equal(applyRoomTransport(second, secondMessage), null);
+  });
+
+  test('reload with a seat id restores the same player', async () => {
+    const kv = createMemoryKv();
+    setRoomKvForTests(kv);
+    const joined = await roomCommand({ op: 'join', team: 'purple', name: 'Ира' });
+    const reloaded = await roomView(joined.playerId!);
+    const full = makeRoomTransport(reloaded, null);
+    const applied = applyRoomTransport(null, full);
+    assert.equal(applied?.you?.team, 'purple');
+    assert.equal(applied?.seats[0].name, 'Ира');
+  });
+
+  test('two players receive the same authoritative game revision', async () => {
+    const kv = createMemoryKv();
+    setRoomKvForTests(kv);
+    const now = Date.now();
+    const room = blankRoom(now);
+    room.started = true;
+    room.paused = true;
+    room.revision = 7;
+    room.seats = [
+      { id: 'seat-1', name: 'Анна', team: 'you', seen: now, ready: false },
+      { id: 'seat-2', name: 'Борис', team: 'red', seen: now, ready: false },
+    ];
+    await kv.set(ROOM_KEY, roomToJson(room));
+    const left = await roomView('seat-1');
+    const right = await roomView('seat-2');
+    assert.equal(left.revision, right.revision);
+    assert.equal(left.revision, 7);
+    assert.deepEqual(left.game, right.game);
+    assert.equal(left.you?.team, 'you');
+    assert.equal(right.you?.team, 'red');
   });
 
   test('two locked polls advance the clock once', async () => {

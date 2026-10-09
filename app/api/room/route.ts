@@ -1,5 +1,6 @@
 import { REDIS_MISSING_ERROR, RedisRequestError, RoomBusyError } from '@/lib/room-store';
 import { roomCommand, roomView, type RoomView } from '@/lib/room';
+import { makeRoomTransport } from '@/lib/room-protocol';
 
 function json(body: unknown, status = 200) {
   return Response.json(body, {
@@ -46,10 +47,12 @@ function failure(error: unknown) {
 }
 
 export async function GET(request: Request) {
-  const player = new URL(request.url).searchParams.get('player');
+  const params = new URL(request.url).searchParams;
+  const player = params.get('player');
   try {
     const view = await roomView(player);
-    return json(view, statusFor(view));
+    if (view.error) return json(view, statusFor(view));
+    return json(makeRoomTransport(view, params.get('cursor')));
   } catch (error) {
     return failure(error);
   }
@@ -60,7 +63,7 @@ export async function POST(request: Request) {
   try {
     body = await request.json();
   } catch {
-    return json({ error: 'Некорректный запрос.' }, { status: 400 });
+    return json({ error: 'Некорректный запрос.' }, 400);
   }
   try {
     const result = await roomCommand(body);
