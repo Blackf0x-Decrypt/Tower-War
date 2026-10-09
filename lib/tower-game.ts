@@ -145,10 +145,10 @@ export type Game = {
   decreeLog: { team: Team; text: string; at: number }[];
 };
 export const TEAMS = {
-  you: { name: 'Я', color: '#4295ff' },
-  red: { name: 'Бот 1', color: '#f27160' },
-  purple: { name: 'Бот 2', color: '#a281ed' },
-  green: { name: 'Бот 3', color: '#54c886' },
+  you: { name: 'Синий', color: '#4295ff' },
+  red: { name: 'Красный', color: '#f27160' },
+  purple: { name: 'Фиолетовый', color: '#a281ed' },
+  green: { name: 'Зелёный', color: '#54c886' },
 };
 export function playerName(g: Game, team: Team) {
   return g.players?.[team] ?? TEAMS[team].name;
@@ -659,15 +659,17 @@ export function startSpell(
     !actingLeader(g, team)
   )
     return g;
-  const nonce = (g.spellSeq ?? 0) + 1;
+  const seated = refreshAuthority(g);
+  if (seated.result || seated.spell || !actingLeader(seated, team)) return g;
+  const nonce = (seated.spellSeq ?? 0) + 1;
   return {
-    ...announcePrompt(g, team, prompt),
+    ...announcePrompt(seated, team, prompt),
     spellSeq: nonce,
     spell: {
       team,
-      epoch: g.authorityEpoch,
+      epoch: seated.authorityEpoch,
       prompt: prompt.slice(0, 350),
-      startedAt: g.age,
+      startedAt: seated.age,
       roll,
       nonce,
     },
