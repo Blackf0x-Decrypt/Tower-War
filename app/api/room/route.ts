@@ -59,7 +59,7 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
-  let body: Parameters<typeof roomCommand>[0];
+  let body: Parameters<typeof roomCommand>[0] & { cursor?: string };
   try {
     body = await request.json();
   } catch {
@@ -67,7 +67,13 @@ export async function POST(request: Request) {
   }
   try {
     const result = await roomCommand(body);
-    return json(result, statusFor(result));
+    if (!Array.isArray(result.seats)) return json(result, statusFor(result));
+    const transport = makeRoomTransport(
+      result,
+      typeof body.cursor === 'string' ? body.cursor : null,
+    );
+    const { troopJournal: _journal, game: _game, ...rest } = result;
+    return json({ ...rest, transport }, statusFor(result));
   } catch (error) {
     return failure(error);
   }

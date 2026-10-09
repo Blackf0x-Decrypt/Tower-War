@@ -1,11 +1,12 @@
 'use client';
 import { memo, useEffect, useRef } from 'react';
-import { type Game, WORLD_WIDTH, WORLD_HEIGHT } from '@/lib/tower-game';
+import { TEAMS, WORLD_WIDTH, WORLD_HEIGHT, type Shot, type Tower, type Troop } from '@/lib/tower-game';
 import type { Camera } from '@/lib/camera';
+import { subscribeDrawSample, type DrawSample } from '@/lib/draw-sample';
 
 const speechWidth = new Map<string, number>();
 
-function towerAt(towers: Game['towers'], id: number) {
+function towerAt(towers: Tower[], id: number) {
   const direct = towers[id];
   if (direct && direct.id === id) return direct;
   for (let i = 0; i < towers.length; i++) if (towers[i].id === id) return towers[i];
@@ -22,38 +23,46 @@ function widthOf(ctx: CanvasRenderingContext2D, text: string) {
 }
 
 // One drawing surface instead of hundreds of independently animated DOM images.
-export const TroopLayer = memo(function TroopLayer({game, camera, viewport, speech, paused}: {
-  game: Game; camera: Camera; viewport: {w:number;h:number}; speech:boolean; paused:boolean;
+export const TroopLayer = memo(function TroopLayer({camera, viewport, speech, paused}: {
+  camera: Camera; viewport: {w:number;h:number}; speech:boolean; paused:boolean;
 }) {
   const canvas = useRef<HTMLCanvasElement>(null);
   const wake = useRef<() => void>(() => {});
   const previous = useRef(new Map<number, {x:number;y:number}>());
-  const slots = useRef<{x:number;y:number}[]>([]);
-  const frame = useRef({game,camera,viewport,speech,paused,at:0,interval:50,previous:previous.current});
-  const painted = useRef({x:Number.NaN,y:Number.NaN,z:Number.NaN,w:0,h:0,game:null as Game|null,speech:false,paused:false,hop:-1});
+  const frame = useRef({
+    troops:[] as Troop[], towers:[] as Tower[], shots:[] as Shot[], age:0, hideMessages:false, gen:0,
+    camera,viewport,speech,paused,at:0,interval:50,previous:previous.current,
+  });
+  const painted = useRef({x:Number.NaN,y:Number.NaN,z:Number.NaN,w:0,h:0,gen:-1,speech:false,paused:false,hop:-1});
   useEffect(()=> {
+    frame.current.camera=camera;
+    frame.current.viewport=viewport;
+    frame.current.speech=speech;
+    frame.current.paused=paused;
+    wake.current();
+  },[camera,viewport,speech,paused]);
+  useEffect(()=> subscribeDrawSample((sample: DrawSample)=> {
     const old=frame.current;
-    if (old.game === game) {
-      old.camera=camera; old.viewport=viewport; old.speech=speech; old.paused=paused;
-      wake.current();
-      return;
-    }
     const now=performance.now();
     const prev=previous.current;
-    prev.clear();
-    if (game.age>=old.game.age && game.age-old.game.age<=.25) {
-      const troops=old.game.troops, pool=slots.current;
-      for (let i=0;i<troops.length;i++) {
-        const p=troops[i];
-        let slot=pool[i];
-        if (!slot) pool[i]=slot={x:0,y:0};
-        slot.x=p.x; slot.y=p.y;
-        prev.set(p.id, slot);
+    const blend=old.paused?1:Math.min(1,(now-old.at)/Math.max(16,old.interval));
+    const blended=new Map<number,{x:number;y:number}>();
+    if (sample.age>=old.age && sample.age-old.age<=1) {
+      for (const troop of old.troops) {
+        const from=prev.get(troop.id)??troop;
+        blended.set(troop.id,{x:from.x+(troop.x-from.x)*blend,y:from.y+(troop.y-from.y)*blend});
       }
     }
-    frame.current={game,camera,viewport,speech,paused,at:now,interval:Math.max(16,Math.min(150,now-old.at)),previous:prev};
+    prev.clear();
+    for (const [id,pos] of blended) prev.set(id,pos);
+    frame.current={
+      troops:sample.troops, towers:sample.towers, shots:sample.shots, age:sample.age,
+      hideMessages:sample.hideMessages, gen:old.gen+1,
+      camera:old.camera, viewport:old.viewport, speech:old.speech, paused:paused || sample.paused,
+      at:now, interval:Math.max(16, old.at>0 ? now-old.at : 50), previous:prev,
+    };
     wake.current();
-  },[game,camera,viewport,speech,paused]);
+  }),[paused]);
   useEffect(()=> {
     let id=0,disposed=false,lastPaint=0;
     const reducedMotion=window.matchMedia('(prefers-reduced-motion: reduce)');
@@ -112,32 +121,32 @@ export const TroopLayer = memo(function TroopLayer({game, camera, viewport, spee
         const blend=f.paused?1:Math.min(1,(now-f.at)/f.interval);
         const moving=blend<1 && !f.paused;
         const mark=painted.current;
-        const same=f.camera.x===mark.x && f.camera.y===mark.y && zoom===mark.z && f.viewport.w===mark.w && f.viewport.h===mark.h && f.game===mark.game && f.speech===mark.speech && f.paused===mark.paused && el.width===width && el.height===height;
-        const animated=!f.paused && !reducedMotion.matches && f.game.troops.some(p=>p.delay<=0);
+        const same=f.camera.x===mark.x && f.camera.y===mark.y && zoom===mark.z && f.viewport.w===mark.w && f.viewport.h===mark.h && f.gen===mark.gen && f.speech===mark.speech && f.paused===mark.paused && el.width===width && el.height===height;
+        const animated=!f.paused && !reducedMotion.matches && f.troops.some(p=>p.delay<=0);
         let paint=true;
         if(same && !moving) {
           if(!animated) paint=false;
           else {
-            const hop=(now/32)|0;
+            const hop=(now/16)|0;
             if(hop===mark.hop) paint=false;
           }
         }
-        if(paint && animated && now-lastPaint<32) paint=false;
+        if(paint && animated && now-lastPaint<16) paint=false;
         if(paint) {
           lastPaint=now;
           if(el.width!==width||el.height!==height){el.width=width;el.height=height;}
           const ctx=el.getContext('2d');
           if(ctx){
             ctx.setTransform(ratio,0,0,ratio,0,0);ctx.clearRect(0,0,f.viewport.w,f.viewport.h);
-            const motion=f.paused?f.game.age:now/1000;
-            const towers=f.game.towers;
+            const motion=f.paused?f.age:now/1000;
+            const towers=f.towers;
             ctx.save();
             ctx.lineCap='round';
             dash[0]=10*zoom; dash[1]=8*zoom;
             ctx.setLineDash(dash);
             ctx.strokeStyle='#c4a15a99'; ctx.lineWidth=3*zoom;
             const cargoRoutes=new Set<string>();
-            for(const p of f.game.troops){
+            for(const p of f.troops){
               if(!p.cargo||p.delay>0)continue;
               const routeKey=`${p.from}:${p.to}`;
               if(cargoRoutes.has(routeKey))continue;
@@ -156,7 +165,36 @@ export const TroopLayer = memo(function TroopLayer({game, camera, viewport, spee
               ctx.beginPath();ctx.moveTo(-3.2,0);ctx.lineTo(3.2,0);ctx.moveTo(0,-3.2);ctx.lineTo(0,3.2);ctx.stroke();
               ctx.restore();
             };
-            for(const p of f.game.troops){
+            for(const shot of f.shots){
+              const tower=towerAt(towers, shot.from);
+              if(!tower) continue;
+              const duration=shot.duration??0.4;
+              const k=Math.min(1,(f.age-shot.at)/duration);
+              const sx=(shot.sx??tower.x)/100*WORLD_WIDTH*zoom+f.camera.x;
+              const sy=(shot.sy??tower.y)/100*WORLD_HEIGHT*zoom+f.camera.y;
+              const ex=shot.x/100*WORLD_WIDTH*zoom+f.camera.x;
+              const ey=shot.y/100*WORLD_HEIGHT*zoom+f.camera.y;
+              const color=TEAMS[shot.team].color;
+              if(k<1){
+                ctx.strokeStyle=color; ctx.lineWidth=2.2*zoom;
+                ctx.beginPath();
+                ctx.moveTo(sx+(ex-sx)*Math.max(0,k-0.18), sy+(ey-sy)*Math.max(0,k-0.18));
+                ctx.lineTo(sx+(ex-sx)*k, sy+(ey-sy)*k);
+                ctx.stroke();
+                ctx.fillStyle=color;
+                ctx.beginPath();
+                ctx.arc(sx+(ex-sx)*k, sy+(ey-sy)*k, 3.2*zoom, 0, Math.PI*2);
+                ctx.fill();
+              } else {
+                const life=Math.max(0,1-(f.age-shot.at-duration)/0.3);
+                ctx.strokeStyle=color; ctx.globalAlpha=life; ctx.lineWidth=1.6*zoom;
+                ctx.beginPath();
+                ctx.arc(ex, ey, (4+(f.age-shot.at-duration)*18)*zoom, 0, Math.PI*2);
+                ctx.stroke();
+                ctx.globalAlpha=1;
+              }
+            }
+            for(const p of f.troops){
               if(p.delay>0)continue;
               const old=f.previous.get(p.id)??p;
               const x=(old.x+(p.x-old.x)*blend)/100*WORLD_WIDTH*zoom+f.camera.x;
@@ -194,7 +232,7 @@ export const TroopLayer = memo(function TroopLayer({game, camera, viewport, spee
                 ctx.drawImage(sprites[p.team],-19,-24,38,48);ctx.restore();
                 if(p.scoutUntil||p.elite){ctx.fillStyle='#fff1a2';ctx.font='bold 14px Arial';ctx.fillText(p.elite?'★':'◉',-6,-46);}
               }
-              if(f.speech&&!f.game.hideMessages&&p.speech&&p.progress>.07&&p.progress<.8){
+              if(f.speech&&!f.hideMessages&&p.speech&&p.progress>.07&&p.progress<.8){
                 ctx.font='12px Arial';ctx.textAlign='center';const w=widthOf(ctx,p.speech)+16;
                 ctx.fillStyle='#fff';ctx.beginPath();ctx.roundRect(-w/2,-68,w,23,7);ctx.fill();
                 ctx.fillStyle='#3b4937';ctx.fillText(p.speech,0,-52);
@@ -202,7 +240,7 @@ export const TroopLayer = memo(function TroopLayer({game, camera, viewport, spee
               ctx.restore();
             }
             mark.x=f.camera.x; mark.y=f.camera.y; mark.z=zoom; mark.w=f.viewport.w; mark.h=f.viewport.h;
-            mark.game=f.game; mark.speech=f.speech; mark.paused=f.paused; mark.hop=(now/32)|0;
+            mark.gen=f.gen; mark.speech=f.speech; mark.paused=f.paused; mark.hop=(now/16)|0;
           }
         }
         if(moving||animated)schedule();

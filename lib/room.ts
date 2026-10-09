@@ -1,4 +1,5 @@
 import { applyPlay, type PlayAction } from './play';
+import { diffTowers, diffTroops, type TroopJournal } from './room-protocol';
 import { initialGame, tick, TEAM_IDS, type Game, type Team } from './tower-game';
 import {
   REDIS_MISSING_ERROR,
@@ -27,6 +28,7 @@ export type Room = {
   clock: number;
   startAt: number | null;
   revision: number;
+  troopJournal?: TroopJournal;
 };
 
 const STALE_MS = 120_000;
@@ -47,6 +49,7 @@ export type RoomView = {
   spellEpoch?: number | null;
   clock?: number;
   revision?: number;
+  troopJournal?: TroopJournal;
 };
 
 export function blankRoom(now = Date.now()): Room {
@@ -104,6 +107,14 @@ export function roomFromJson(raw: string): Room {
   }
   if (data.startAt != null && !Number.isFinite(data.startAt)) data.startAt = null;
   if (!Number.isSafeInteger(data.revision) || data.revision < 0) data.revision = 0;
+  const journal = data.troopJournal;
+  if (
+    journal &&
+    (!Number.isSafeInteger(journal.from) ||
+      journal.from < 0 ||
+      !Array.isArray(journal.ops))
+  )
+    delete data.troopJournal;
   return data;
 }
 
@@ -158,6 +169,7 @@ function noteSeen(current: Room, playerId: string | null | undefined, now: numbe
 }
 
 function dropStale(current: Room, now: number) {
+  if (current.started) return;
   const gone = current.seats.filter((s) => now - s.seen > STALE_MS);
   if (!gone.length) return;
   current.seats = current.seats.filter((s) => now - s.seen <= STALE_MS);
@@ -198,6 +210,7 @@ function viewOf(current: Room, playerId: string | null): RoomView {
     you: seat ? { team: seat.team, ready: seat.ready } : null,
     clock: current.clock,
     revision: current.revision,
+    troopJournal: current.troopJournal,
   };
 }
 
@@ -227,11 +240,29 @@ async function editRoom<T>(
     (raw) => {
       const now = Date.now();
       const room = raw ? roomFromJson(raw) : blankRoom(now);
+      const beforeTroops = room.game.troops;
+      const beforeTowers = room.game.towers;
+      const beforeRevision = room.revision;
       const before = publicState(room);
       const result = fn(room, now);
-      if (publicState(room) !== before) room.revision += 1;
-      if (result && typeof result === 'object' && 'revision' in result)
-        (result as { revision?: number }).revision = room.revision;
+      if (publicState(room) !== before) {
+        room.revision = beforeRevision + 1;
+        const troops = diffTroops(
+          beforeTroops,
+          room.started ? room.game.troops : [],
+        );
+        room.troopJournal = {
+          from: beforeRevision,
+          ops: troops.ops,
+          ...(troops.order ? { order: troops.order } : {}),
+          towers: diffTowers(beforeTowers, room.started ? room.game.towers : beforeTowers),
+        };
+      }
+      if (result && typeof result === 'object') {
+        const view = result as RoomView;
+        if ('revision' in view) view.revision = room.revision;
+        if (Array.isArray(view.seats)) view.troopJournal = room.troopJournal;
+      }
       return { json: roomToJson(room), result };
     },
     attempts,
@@ -276,6 +307,19 @@ export async function roomCommand(body: {
     prepare(current, body.playerId, now);
     const op = body.op;
     if (op === 'join') {
+      if (body.playerId) {
+        const existing = current.seats.find((s) => s.id === body.playerId);
+        if (existing) {
+          existing.seen = now;
+          const name = String(body.name || '').trim().slice(0, 16);
+          if (name) existing.name = name;
+          return {
+            ...viewOf(current, existing.id),
+            playerId: existing.id,
+            team: existing.team,
+          };
+        }
+      }
       if (current.started)
         return { error: 'Матч уже идёт. Дождитесь конца или сброса.' };
       if (!isTeam(body.team)) return { error: 'Нет такого цвета.' };
@@ -355,6 +399,7 @@ export async function roomCommand(body: {
         return viewOf(current, seat.id);
       current.game = applyPlay(current.game, seat.team, body.action);
       return {
+        ...viewOf(current, seat.id),
         ok: true,
         spellNonce: current.game.spell?.nonce ?? null,
         spellEpoch: current.game.spell?.epoch ?? null,

@@ -19,10 +19,16 @@ import {
   storeMode,
   withLock,
 } from './room-store';
+import { initialGame, tick } from './tower-game';
+import { battleRenderInput, reactStamp, skipBattleRender } from './live-view';
 import {
   applyRoomTransport,
+  applyTroopOps,
+  diffTroops,
   makeRoomTransport,
+  payloadBytes,
 } from './room-protocol';
+import { POST } from '../app/api/room/route';
 
 const REDIS_ENV_NAMES = REDIS_ENV_PAIRS.flat();
 
@@ -67,7 +73,7 @@ describe('room store', { concurrency: 1 }, () => {
     assert.equal(loaded.seats[0].team, 'you');
     const again = await roomView(joined.playerId!);
     assert.equal(again.you?.team, 'you');
-    assert.equal(again.seats[0].name, 'Анна');
+    assert.equal(again.seats?.[0].name, 'Анна');
   });
 
   test('room transport applies full then compact delta', () => {
@@ -396,5 +402,313 @@ describe('room store', { concurrency: 1 }, () => {
     assert.equal(encoded.includes('test-token'), false);
     delete process.env.VERCEL;
     clearRedisEnv();
+  });
+
+  test('troop moves are a small delta and keep every other tower', () => {
+    const room = blankRoom(1000);
+    room.started = true;
+    room.revision = 4;
+    room.game = {
+      ...room.game,
+      troops: Array.from({ length: 1000 }, (_, index) => ({
+        id: index + 1,
+        team: 'you' as const,
+        from: 0,
+        to: 1,
+        x: 10 + (index % 30) * 0.1,
+        y: 12 + (index % 17) * 0.1,
+        sx: 10,
+        sy: 12,
+        progress: 0.2,
+        delay: 0,
+        speech: '',
+        cargo: false,
+        strength: 1,
+      })),
+      nextId: 1001,
+    };
+    const baseView = {
+      seats: [] as { name: string; team: 'you'; ready: boolean }[],
+      started: true,
+      paused: true,
+      startAt: null,
+      game: room.game,
+      you: { team: 'you' as const, ready: false },
+      revision: 4,
+    };
+    const full = makeRoomTransport(baseView, null);
+    const applied = applyRoomTransport(null, full);
+    assert.ok(applied?.game);
+    const move = (count: number) => ({
+      ...room.game,
+      troops: room.game.troops.map((troop, index) =>
+        index < count
+          ? { ...troop, x: troop.x + 1.25, y: troop.y + 0.4, progress: troop.progress + 0.05 }
+          : troop,
+      ),
+    });
+    const one = move(1);
+    const oneDelta = diffTroops(room.game.troops, one.troops);
+    const oneMessage = makeRoomTransport(
+      {
+        ...baseView,
+        revision: 5,
+        game: one,
+        troopJournal: { from: 4, ...oneDelta },
+      },
+      applied!.cursor,
+    );
+    const ten = move(10);
+    const tenDelta = diffTroops(room.game.troops, ten.troops);
+    const tenMessage = makeRoomTransport(
+      {
+        ...baseView,
+        revision: 5,
+        game: ten,
+        troopJournal: { from: 4, ...tenDelta },
+      },
+      applied!.cursor,
+    );
+    const unchanged = makeRoomTransport(baseView, applied!.cursor);
+    const fullBytes = payloadBytes(full);
+    const noopBytes = payloadBytes(unchanged);
+    const oneBytes = payloadBytes(oneMessage);
+    const tenBytes = payloadBytes(tenMessage);
+    console.log(
+      `PAYLOAD noop=${noopBytes} oneTroop=${oneBytes} tenTroops=${tenBytes} full=${fullBytes}`,
+    );
+    assert.equal(unchanged.transport, 'noop');
+    assert.ok(noopBytes < 80, `noop ${noopBytes}`);
+    assert.equal(oneMessage.transport, 'delta');
+    assert.equal(tenMessage.transport, 'delta');
+    assert.ok(oneBytes < 5000, `one troop delta ${oneBytes}`);
+    assert.ok(tenBytes < 5000, `ten troop delta ${tenBytes}`);
+    assert.ok(fullBytes > 10000, `full ${fullBytes}`);
+    if (oneMessage.transport !== 'delta' || tenMessage.transport !== 'delta') return;
+    assert.equal(oneMessage.game?.troops?.ops.length, 1);
+    assert.equal(oneMessage.game?.troops?.ops[0]?.[0], 'm');
+    assert.equal(oneMessage.game?.towerPatch, undefined);
+    const updated = applyRoomTransport(applied, oneMessage);
+    const fullOne = applyRoomTransport(null, makeRoomTransport({ ...baseView, revision: 5, game: one }, null));
+    assert.deepEqual(updated?.game?.troops, fullOne?.game?.troops);
+    assert.strictEqual(updated?.game?.towers, applied?.game?.towers);
+    assert.strictEqual(updated?.game?.routes, applied?.game?.routes);
+    assert.equal(reactStamp(applied!.game!), reactStamp(updated!.game!));
+    const ui = {
+      me: 'you' as const,
+      selected: 0,
+      speech: true,
+      routeMode: true,
+      scoutMode: false,
+      paused: false,
+      help: false,
+      recording: false,
+    };
+    let battleRenders = 1;
+    if (!skipBattleRender(battleRenderInput(applied!.game!, ui), battleRenderInput(updated!.game!, ui)))
+      battleRenders += 1;
+    assert.equal(battleRenders, 1);
+    console.log('browser FPS was not re-measured');
+    const tenApplied = applyRoomTransport(applied, tenMessage);
+    const fullTen = applyRoomTransport(
+      null,
+      makeRoomTransport({ ...baseView, revision: 5, game: ten }, null),
+    );
+    assert.deepEqual(tenApplied?.game?.troops, fullTen?.game?.troops);
+    assert.strictEqual(tenApplied?.game?.towers[3], applied?.game?.towers[3]);
+  });
+
+  test('a real tick delta matches the troop list and a missed revision resyncs', () => {
+    let game = initialGame();
+    game = {
+      ...game,
+      troops: [
+        {
+          id: 1,
+          team: 'you',
+          from: 0,
+          to: 6,
+          x: game.towers[0].x,
+          y: game.towers[0].y,
+          sx: game.towers[0].x,
+          sy: game.towers[0].y,
+          progress: 0,
+          delay: 0,
+          speech: '',
+          cargo: false,
+          strength: 4,
+        },
+      ],
+      nextId: 2,
+    };
+    const ticked = tick(game, 0.05);
+    const delta = diffTroops(game.troops, ticked.troops);
+    assert.deepEqual(applyTroopOps(game.troops, delta), ticked.troops);
+    const view = {
+      seats: [] as { name: string; team: 'you'; ready: boolean }[],
+      started: true,
+      paused: false,
+      startAt: null,
+      game,
+      you: null,
+      revision: 1,
+    };
+    const applied = applyRoomTransport(null, makeRoomTransport(view, null));
+    const stepped = makeRoomTransport(
+      { ...view, game: ticked, revision: 2, troopJournal: { from: 1, ...delta, towers: undefined } },
+      applied!.cursor,
+    );
+    assert.equal(stepped.transport, 'delta');
+    if (stepped.transport !== 'delta') return;
+    const jumped = makeRoomTransport(
+      { ...view, game: tick(ticked, 0.05), revision: 3, troopJournal: { from: 2, ops: [] } },
+      applied!.cursor,
+    );
+    assert.equal(jumped.transport, 'full');
+    assert.equal(applyRoomTransport(applied, { ...stepped, base: 'stale' }), null);
+  });
+
+  test('started match rejoins the same seat and rejects a new player', async () => {
+    const kv = createMemoryKv();
+    setRoomKvForTests(kv);
+    const now = Date.now();
+    const room = blankRoom(now);
+    room.started = true;
+    room.paused = true;
+    room.seats = [
+      { id: 'seat-anna', name: 'Анна', team: 'you', seen: now, ready: false },
+    ];
+    await kv.set(ROOM_KEY, roomToJson(room));
+    const again = await roomCommand({
+      op: 'join',
+      playerId: 'seat-anna',
+      team: 'red',
+      name: 'Анна',
+    });
+    assert.equal(again.error, undefined);
+    assert.equal(again.playerId, 'seat-anna');
+    assert.equal(again.you?.team, 'you');
+    const stranger = await roomCommand({ op: 'join', team: 'red', name: 'Борис' });
+    assert.match(stranger.error || '', /Матч уже идёт/);
+    assert.equal(stranger.playerId, undefined);
+    const loaded = roomFromJson((await kv.get(ROOM_KEY))!);
+    assert.equal(loaded.seats.length, 1);
+    assert.equal(loaded.seats[0].id, 'seat-anna');
+  });
+
+  test('an attack POST delta is visible without another poll', async () => {
+    const kv = createMemoryKv();
+    setRoomKvForTests(kv);
+    const now = Date.now();
+    const room = blankRoom(now);
+    room.started = true;
+    room.paused = false;
+    room.clock = now;
+    room.revision = 2;
+    room.seats = [
+      { id: 'seat-1', name: 'Анна', team: 'you', seen: now, ready: false },
+      { id: 'seat-2', name: 'Борис', team: 'red', seen: now, ready: false },
+    ];
+    room.game = { ...room.game, humans: ['you', 'red'] };
+    await kv.set(ROOM_KEY, roomToJson(room));
+    const viewed = await roomView('seat-1');
+    const cursor = makeRoomTransport(viewed, null);
+    const seated = applyRoomTransport(null, cursor);
+    const response = await POST(
+      new Request('http://localhost/api/room', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          op: 'action',
+          playerId: 'seat-1',
+          cursor: seated!.cursor,
+          action: { type: 'army', from: 0, to: 1, fraction: 1 },
+        }),
+      }),
+    );
+    const body = (await response.json()) as {
+      spellNonce?: number | null;
+      transport?: ReturnType<typeof makeRoomTransport>;
+      game?: unknown;
+    };
+    assert.equal(response.status, 200);
+    assert.equal(body.game, undefined);
+    assert.equal(body.transport?.transport, 'delta');
+    const applied = applyRoomTransport(seated, body.transport!);
+    assert.ok((applied?.game?.troops.length ?? 0) > 0);
+    assert.ok((applied?.game?.troops.length ?? 0) < 40);
+    if (body.transport?.transport === 'delta') {
+      assert.ok(payloadBytes(body.transport) < 8000);
+      const spawned = body.transport.game?.troops?.ops.filter((op) => op[0] === 's') ?? [];
+      assert.ok(spawned.length > 0);
+    }
+    const other = await roomView('seat-2');
+    assert.equal(other.game?.troops.length, applied?.game?.troops.length);
+    assert.equal(other.revision, applied?.revision);
+  });
+
+  test('four polls share one clock and a lock miss does not double-advance', async () => {
+    const kv = createMemoryKv();
+    setRoomKvForTests(kv);
+    const now = Date.now();
+    const room = blankRoom(now - 5000);
+    room.started = true;
+    room.paused = false;
+    room.clock = now - 5000;
+    room.game = { ...room.game, elapsed: 1.25 };
+    room.seats = [1, 2, 3, 4].map((n) => ({
+      id: `seat-${n}`,
+      name: `Игрок ${n}`,
+      team: (['you', 'red', 'purple', 'green'] as const)[n - 1],
+      seen: now,
+      ready: false,
+    }));
+    await kv.set(ROOM_KEY, roomToJson(room));
+    const views = await Promise.all([1, 2, 3, 4].map((n) => roomView(`seat-${n}`)));
+    const saved = roomFromJson((await kv.get(ROOM_KEY))!);
+    assert.ok(Math.abs(saved.game.elapsed - 1.65) < 1e-9, `elapsed ${saved.game.elapsed}`);
+    for (const view of views) {
+      const elapsed = view.game?.elapsed ?? -1;
+      assert.ok(
+        Math.abs(elapsed - 1.25) < 1e-9 || Math.abs(elapsed - 1.65) < 1e-9,
+        `clock ${elapsed}`,
+      );
+    }
+    assert.equal(views[0].game?.troops.length, views[1].game?.troops.length);
+
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const locking = withLock(kv, () => gate);
+    const missed = await roomView('seat-1');
+    assert.ok(Math.abs((missed.game?.elapsed ?? -1) - saved.game.elapsed) < 1e-9);
+    release();
+    await locking;
+    const next = await roomView('seat-2');
+    assert.ok(
+      Math.abs((next.game?.elapsed ?? 0) - saved.game.elapsed) < 0.2,
+      `jumped to ${next.game?.elapsed}`,
+    );
+  });
+
+  test('bots do not march or cast during the first four minutes and gold mines do not recruit', () => {
+    let game = initialGame();
+    game = {
+      ...game,
+      towers: game.towers.map((tower) =>
+        tower.kind === 'gold' ? { ...tower, team: 'you' as const, count: 5 } : tower,
+      ),
+    };
+    const goldBefore = game.towers.find((tower) => tower.kind === 'gold')!.count;
+    for (let i = 0; i < 400; i++) game = tick(game, 0.05);
+    assert.ok(game.age < 240);
+    assert.equal(
+      game.troops.filter((troop) => troop.team !== 'you').length,
+      0,
+    );
+    assert.equal(game.spell, undefined);
+    const gold = game.towers.find((tower) => tower.kind === 'gold' && tower.team === 'you')!;
+    assert.equal(gold.count, goldBefore);
   });
 });

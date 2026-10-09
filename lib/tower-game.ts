@@ -1408,6 +1408,7 @@ export function tick(previous: Game, dt = 0.05): Game {
         (t) => t.team === team && t.level >= 2 && !t.specialty,
       );
       if (branch) g = specialize(g, branch.id, specialties(branch)[0], team);
+      if (g.age < DEVELOPMENT_SECONDS) continue;
       if (
         buildings[0] &&
         g.age > 60 &&
@@ -1458,6 +1459,7 @@ export function tick(previous: Game, dt = 0.05): Game {
   }
   g = refreshAuthority(g);
   if (
+    g.age >= DEVELOPMENT_SECONDS &&
     g.authority &&
     !humanTeams(g).includes(g.authority) &&
     g.age - g.leaderSince >= 6 &&

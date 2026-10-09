@@ -1,5 +1,6 @@
 'use client';
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { BattlefieldLayer, type TowerHandlers } from '@/components/battlefield-layer';
 import { TroopLayer } from '@/components/troop-layer';
 import { OwnershipFilters } from '@/components/ownership-filters';
 import {
@@ -11,7 +12,6 @@ import {
   Crosshair,
   Plus,
   Minus,
-  Repeat2,
   Crown,
   Send,
   Sparkles,
@@ -19,10 +19,8 @@ import {
   Check,
   ChevronRight,
   Flag,
-  Package,
   Pause,
   Play,
-  Radio,
   RotateCcw,
   Volume2,
   VolumeX,
@@ -38,6 +36,8 @@ import {
 import { validDecree } from '@/lib/decrees';
 import { validDebuff } from '@/lib/magic';
 import { applyPlay, type PlayAction } from '@/lib/play';
+import { publishDrawSample } from '@/lib/draw-sample';
+import { reactStamp, retainBattle } from '@/lib/live-view';
 import {
   applyRoomTransport,
   type AppliedRoom,
@@ -54,7 +54,6 @@ import {
   workers,
   cannon,
   cannonCost,
-  cannonHeight,
   production,
   capacity,
   groupSize,
@@ -157,6 +156,19 @@ export default function Home() {
   if (seat) seatRef.current = seat;
   const transportRef = useRef<AppliedRoom | null>(null);
   const sharedRef = useRef(false);
+  const pushRef = useRef<(next: Game, force?: boolean) => void>(() => {});
+  const ingestRef = useRef<(message: RoomTransport) => AppliedRoom | null>(() => null);
+  const pausedRef = useRef(false);
+  const roomPausedRef = useRef(false);
+  const startedRef = useRef(false);
+  const lobbyKeyRef = useRef('');
+  const stampRef = useRef('');
+  const shownRef = useRef<Game | null>(null);
+  const towerHandlers = useRef<TowerHandlers>({
+    tower: () => {},
+    clear: () => {},
+    scout: () => {},
+  });
   const meRef = useRef<Team>('you');
   meRef.current = seat?.team ?? 'you';
   const [draft, setDraft] = useState('');
@@ -196,13 +208,14 @@ export default function Home() {
             replayCarry.current -= replayStep;
             const next = advanceReplay(replayState.current,replayStep,recording);
             replayState.current=next;
-            setGame(next.game);
+            pushRef.current(next.game);
             if(next.game.age>=recording.duration)setPaused(true);
           }
-        } else if (!sharedRef.current) setGame(g=> {
-          for(let i=0;i<steps;i++)g=tick(g,.05);
-          return g;
-        });
+        } else if (!sharedRef.current && !seatRef.current) {
+          let g = gameRef.current;
+          for (let i = 0; i < steps; i++) g = tick(g, 0.05);
+          pushRef.current(g);
+        }
       }
       handle=requestAnimationFrame(update);
     };
@@ -221,7 +234,42 @@ export default function Home() {
     return () => window.removeEventListener('keydown', listener);
   }, []);
   const gameRef = useRef(game);
-  gameRef.current = game;
+  pausedRef.current = paused || help;
+  startedRef.current = started;
+  if (!shownRef.current) {
+    shownRef.current = game;
+    stampRef.current = reactStamp(game);
+  }
+  function pushGame(next: Game, force = false) {
+    gameRef.current = next;
+    publishDrawSample(next, pausedRef.current);
+    const stamp = reactStamp(next);
+    if (!force && stamp === stampRef.current) return;
+    stampRef.current = stamp;
+    const shown = retainBattle(shownRef.current ?? next, next);
+    shownRef.current = shown;
+    setGame(shown);
+  }
+  pushRef.current = pushGame;
+  function roomFailure(data: { code?: string; error?: string }) {
+    return (
+      data.code === 'redis_missing' ||
+      data.code === 'redis_error' ||
+      data.code === 'room_error' ||
+      data.code === 'room_busy'
+    );
+  }
+  function ingest(message: RoomTransport) {
+    const data = applyRoomTransport(transportRef.current, message);
+    if (!data) {
+      transportRef.current = null;
+      return null;
+    }
+    transportRef.current = data;
+    if (message.transport !== 'noop' && data.game) pushGame(data.game);
+    return data;
+  }
+  ingestRef.current = ingest;
   const activeRef = useRef(false);
   activeRef.current = started && !paused && !help && !game.result && !recording;
   useLayoutEffect(() => {
@@ -269,24 +317,49 @@ export default function Home() {
         );
         if (!response.ok) {
           try {
-            const failed = (await response.json()) as { error?: string };
+            const failed = (await response.json()) as { error?: string; code?: string };
             if (failed.error) setRoomError(failed.error);
           } catch {}
           return;
         }
         const message = (await response.json()) as RoomTransport;
         if (stop || mine !== ticket) return;
-        const data = applyRoomTransport(transportRef.current, message);
-        if (!data) {
-          transportRef.current = null;
-          return;
-        }
-        transportRef.current = data;
+        const data = ingestRef.current(message);
+        if (!data) return;
         setRoomError('');
         if (message.transport === 'noop') return;
         if (id && seatRef.current?.id === id && !data.you) {
+          if (message.transport !== 'full') return;
+          if (data.started) {
+            const saved = readSavedSeat();
+            if (saved && misses < 1) {
+              misses += 1;
+              const rejoined = await fetch('/api/room', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  op: 'join',
+                  playerId: saved.playerId,
+                  team: saved.team,
+                  name: saved.name,
+                  cursor: transportRef.current?.cursor,
+                }),
+              });
+              if (rejoined.ok) {
+                const body = (await rejoined.json()) as {
+                  playerId?: string;
+                  error?: string;
+                  transport?: RoomTransport;
+                };
+                if (body.transport) ingestRef.current(body.transport);
+                if (body.playerId) return;
+                if (body.error) setRoomError(body.error);
+              }
+            }
+            return;
+          }
           misses += 1;
-          if (misses < 2) return;
+          if (misses < 3) return;
           writeSavedSeat(null);
           sharedRef.current = false;
           seatRef.current = null;
@@ -298,19 +371,31 @@ export default function Home() {
           return;
         }
         misses = 0;
-        setLobby(data);
+        const lobbyKey = JSON.stringify({
+          seats: data.seats,
+          started: data.started,
+          paused: data.paused,
+          startAt: data.startAt,
+          you: data.you,
+        });
+        if (lobbyKey !== lobbyKeyRef.current) {
+          lobbyKeyRef.current = lobbyKey;
+          setLobby(data);
+        }
         if (seatRef.current && data.started && data.game) {
           if (!sharedRef.current) initialized.current = false;
           sharedRef.current = true;
-          setStarted(true);
-          setPaused(data.paused);
-          setGame(data.game);
+          if (!startedRef.current) setStarted(true);
+          if (roomPausedRef.current !== data.paused) {
+            roomPausedRef.current = data.paused;
+            setPaused(data.paused);
+          }
           setResuming(false);
         } else if (sharedRef.current && !data.started) {
           sharedRef.current = false;
           initialized.current = false;
           setStarted(false);
-          setGame(initialGame());
+          pushRef.current(initialGame(), true);
           setResuming(false);
         } else if (data.you) {
           setResuming(false);
@@ -319,7 +404,13 @@ export default function Home() {
     };
     const arm = () => {
       window.clearTimeout(timer);
-      const delay = document.hidden ? 10000 : seatRef.current ? 500 : 1000;
+      const delay = document.hidden
+        ? 8000
+        : !seatRef.current
+          ? 1000
+          : sharedRef.current
+            ? 80
+            : 400;
       timer = window.setTimeout(() => {
         void pull().finally(() => {
           if (!stop) arm();
@@ -560,13 +651,13 @@ export default function Home() {
     replayCarry.current = 0;
     const next = seekReplay(recording, time);
     replayState.current = next;
-    setGame(next.game);
+    pushGame(next.game, true);
   }
   function leaveRecording() {
     const saved = savedLive.current;
     setRecording(null);
     replayState.current = null;
-    setGame(saved?.game ?? initialGame());
+    pushGame(saved?.game ?? initialGame(), true);
     setStarted(saved?.started ?? false);
     setPaused(!!saved?.started);
     setShowSettings(false);
@@ -620,7 +711,7 @@ export default function Home() {
     setBusy(false);
     setDraft('');
     setPromptMessage('');
-    setGame(initialGame());
+    pushGame(initialGame(), true);
     setSelected(null);
     setScoutMode(false);
     setRouteMode(true);
@@ -642,25 +733,50 @@ export default function Home() {
     const response = await fetch('/api/room', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        ...body,
+        cursor: transportRef.current?.cursor,
+      }),
     });
-    return (await response.json()) as {
+    const data = (await response.json()) as {
       error?: string;
+      code?: string;
       playerId?: string;
       team?: Team;
       started?: boolean;
       paused?: boolean;
-      game?: Game | null;
       seats?: { name: string; team: Team; ready: boolean }[];
       you?: { team: Team; ready: boolean } | null;
       startAt?: number | null;
       spellNonce?: number | null;
       spellEpoch?: number | null;
+      transport?: RoomTransport;
     };
+    if (!response.ok) {
+      if (data.error) setRoomError(data.error);
+      return data;
+    }
+    if (data.transport) {
+      const applied = ingest(data.transport);
+      if (applied && roomPausedRef.current !== applied.paused) {
+        roomPausedRef.current = applied.paused;
+        setPaused(applied.paused);
+      }
+      if (applied?.game && (applied.started || data.started)) {
+        sharedRef.current = true;
+        if (!startedRef.current) setStarted(true);
+      }
+    }
+    return data;
   }
   async function sit(team: Team) {
     setRoomError('');
-    const data = await roomPost({ op: 'join', team, name: callName });
+    const data = await roomPost({
+      op: 'join',
+      team,
+      name: callName,
+      playerId: seatRef.current?.id,
+    });
     if (data.error || !data.playerId || !data.team) {
       setRoomError(data.error || 'Не удалось занять цвет.');
       return;
@@ -692,14 +808,16 @@ export default function Home() {
         nonce: typeof data.spellNonce === 'number' ? data.spellNonce : null,
         epoch: typeof data.spellEpoch === 'number' ? data.spellEpoch : null,
         error: typeof data.error === 'string' ? data.error : undefined,
+        code: typeof data.code === 'string' ? data.code : undefined,
       }));
     }
     const next = applyPlay(gameRef.current, actor, action);
-    gameRef.current = next;
-    setGame(next);
+    pushGame(next, true);
     return Promise.resolve({
       nonce: next.spell?.nonce ?? null,
       epoch: next.spell?.epoch ?? null,
+      error: undefined as string | undefined,
+      code: undefined as string | undefined,
     });
   }
   const clickTower = (t: Tower) => {
@@ -727,10 +845,13 @@ export default function Home() {
       setSelected(null);
     } else if (t.team === me) setSelected(t.id);
     else
-      setGame((g) => ({
-        ...g,
-        notice: 'Сначала выберите свою башню, затем нажмите на цель.',
-      }));
+      pushGame(
+        {
+          ...gameRef.current,
+          notice: 'Сначала выберите свою башню, затем нажмите на цель.',
+        },
+        true,
+      );
   };
   const onTowerClick = (t: Tower) => {
     if (
@@ -747,6 +868,11 @@ export default function Home() {
       return;
     }
     clickTower(t);
+  };
+  towerHandlers.current.tower = onTowerClick;
+  towerHandlers.current.clear = () => setSelected(null);
+  towerHandlers.current.scout = (from, x, y) => {
+    play({ type: 'scout', from, x, y });
   };
   async function submitPrompt(e: React.FormEvent) {
     e.preventDefault();
@@ -791,9 +917,12 @@ export default function Home() {
       if (typeof startedSpell?.epoch === 'number') epoch = startedSpell.epoch;
       if (request.signal.aborted) return;
       if (nonce == null) {
-        setPromptMessage(
-          startedSpell?.error || 'Приказ не начат. Лидерство уже у другого.',
-        );
+        if (roomFailure({ code: startedSpell?.code, error: startedSpell?.error }))
+          setRoomError(startedSpell?.error || 'Комната временно недоступна.');
+        else
+          setPromptMessage(
+            startedSpell?.error || 'Приказ не начат. Лидерство уже у другого.',
+          );
         return;
       }
       const response = await fetch('/api/decree', {
@@ -1085,15 +1214,18 @@ export default function Home() {
             aria-label={paused ? 'Продолжить' : 'Пауза'}
             disabled={!!game.result}
             onClick={() => {
+              const next = !paused;
               if (sharedRef.current && seatRef.current) {
+                roomPausedRef.current = next;
+                setPaused(next);
                 void roomPost({
                   op: 'pause',
                   playerId: seatRef.current.id,
-                  paused: !paused,
+                  paused: next,
                 });
                 return;
               }
-              setPaused(!paused);
+              setPaused(next);
             }}
           >
             {paused ? <Play size={19} /> : <Pause size={19} />}
@@ -1351,342 +1483,18 @@ export default function Home() {
                 ),
               }}
             />
-            <div className="battle-units">
-              <svg className="ground-routes" aria-hidden="true">
-                {game.automation.map((route) => {
-                  const a = game.towers[route.from];
-                  const b = game.towers[route.to];
-                  if (!a || !b) return null;
-                  return (
-                    <line
-                      key={`${route.team}-${route.from}-${route.to}`}
-                      x1={a.x}
-                      y1={a.y}
-                      x2={b.x}
-                      y2={b.y}
-                      stroke={TEAMS[route.team].color}
-                      strokeWidth="1.15"
-                      strokeLinecap="round"
-                      opacity="0.72"
-                    />
-                  );
-                })}
-              </svg>
-              <svg
-                className="routes"
-                viewBox="0 0 100 100"
-                preserveAspectRatio="none"
-                aria-hidden="true"
-              >
-                <defs>
-                  <marker
-                    id="arrow"
-                    viewBox="0 0 10 10"
-                    refX="8"
-                    refY="5"
-                    markerWidth="3"
-                    markerHeight="3"
-                    orient="auto-start-reverse"
-                  >
-                    <path d="M 0 0 L 10 5 L 0 10 z" fill="#fff" />
-                  </marker>
-                </defs>
-                {[
-                  ...game.routes,
-                  ...game.automation
-                    .filter(
-                      (a) =>
-                        !game.routes.some(
-                          (r) => r.from === a.from && r.to === a.to,
-                        ),
-                    )
-                    .map((a) => ({ ...a, until: Infinity })),
-                ].map((r) => {
-                  const a = game.towers[r.from],
-                    b = game.towers[r.to];
-                  return (
-                    <g key={`${r.from}-${r.to}`}>
-                      <line
-                        x1={a.x}
-                        y1={a.y}
-                        x2={b.x}
-                        y2={b.y}
-                        stroke={TEAMS[r.team].color}
-                        strokeWidth=".5"
-                        opacity=".25"
-                      />
-                      <line
-                        className="route-dashes"
-                        x1={a.x}
-                        y1={a.y}
-                        x2={b.x}
-                        y2={b.y}
-                        stroke={TEAMS[r.team].color}
-                        strokeWidth=".22"
-                        strokeDasharray=".7 .8"
-                        markerEnd="url(#arrow)"
-                      />
-                    </g>
-                  );
-                })}
-                {source && hasCannon(source) && (
-                  <ellipse
-                    cx={source.x}
-                    cy={source.y}
-                    rx={(cannon(source).range / WORLD_WIDTH) * 100}
-                    ry={(cannon(source).range / WORLD_HEIGHT) * 100}
-                    fill="#ffffff08"
-                    stroke="#fff5be99"
-                    strokeWidth=".1"
-                    strokeDasharray=".4 .4"
-                  />
-                )}
-                {(game.shots ?? []).map((shot) => {
-                  const t = game.towers[shot.from],
-                    k = Math.min(
-                      1,
-                      (game.age - shot.at) / (shot.duration ?? 0.4),
-                    ),
-                    sx = shot.sx ?? t.x,
-                    sy = shot.sy ?? t.y;
-                  return (
-                    <g key={shot.id}>
-                      {k < 1 ? (
-                        <>
-                          <line
-                            x1={sx + (shot.x - sx) * Math.max(0, k - 0.18)}
-                            y1={sy + (shot.y - sy) * Math.max(0, k - 0.18)}
-                            x2={sx + (shot.x - sx) * k}
-                            y2={sy + (shot.y - sy) * k}
-                            stroke={TEAMS[shot.team].color}
-                            strokeWidth=".22"
-                          />
-                          <ellipse
-                            cx={sx + (shot.x - sx) * k}
-                            cy={sy + (shot.y - sy) * k}
-                            rx=".23"
-                            ry=".32"
-                            fill={TEAMS[shot.team].color}
-                            stroke="#fff"
-                            strokeWidth=".07"
-                          />
-                        </>
-                      ) : (
-                        <ellipse
-                          cx={shot.x}
-                          cy={shot.y}
-                          rx={
-                            0.2 +
-                            (game.age - shot.at - (shot.duration ?? 0.4)) * 2
-                          }
-                          ry={
-                            0.3 +
-                            (game.age - shot.at - (shot.duration ?? 0.4)) * 3
-                          }
-                          fill="none"
-                          stroke={TEAMS[shot.team].color}
-                          strokeWidth=".15"
-                          opacity={Math.max(
-                            0,
-                            1 -
-                              (game.age - shot.at - (shot.duration ?? 0.4)) /
-                                0.3,
-                          )}
-                        />
-                      )}
-                    </g>
-                  );
-                })}
-              </svg>
-              {source && (
-                <div className="target-hint">
-                  Выбрано: {source.name}
-                  <ChevronRight size={16} />{' '}
-                  {scoutMode
-                    ? 'Укажите точку разведки'
-                    : routeMode
-                      ? 'Цель маршрута'
-                      : 'Цель атаки'}{' '}
-                  <button
-                    onClick={() => setSelected(null)}
-                    aria-label="Отменить выбор"
-                  >
-                    <X size={14} />
-                  </button>
-                </div>
-              )}
-              {game.towers.map((t) => (
-                <button
-                  key={t.id}
-                  onClick={() => onTowerClick(t)}
-                  className={`tower team-${t.team ?? 'neutral'} ${source?.id === t.id ? 'selected' : ''} ${t.kind} ${t.ruinedAt !== undefined ? 'ruined' : ''} ${t.ruinedAt !== undefined && game.age - t.ruinedAt < 8 ? 'burning-site' : ''} ${t.home ? 'headquarters' : ''} ${game.flash === t.id ? 'captured' : ''}`}
-                  style={
-                    {
-                      left: `${t.x}%`,
-                      top: `${t.y}%`,
-                      zIndex: Math.round(t.y) + 20,
-                      '--color': t.team ? TEAMS[t.team].color : '#a8a9a1',
-                      '--gun-height': `${cannonHeight(t)}px`,
-                    } as React.CSSProperties
-                  }
-                  aria-label={`${t.name}, ${t.team ? playerName(game, t.team) : 'нейтральная'}, ${Math.floor(t.count)} бойцов`}
-                >
-                  {game.explosions?.some(e => e.id === t.id && game.age-e.at < 3) && <span className="base-explosion" key={Math.floor(game.age)}>💥</span>}
-                  {t.ruinedAt !== undefined && (
-                    <span
-                      className={`burn-remains ${game.age - t.ruinedAt < 8 ? 'burning' : ''}`}
-                      aria-label="Сгоревшая лесопилка"
-                    >
-                      {game.age - t.ruinedAt < 8 ? '🔥' : '🪨'}
-                    </span>
-                  )}
-                  <span className="selection-ring" />
-                  {!t.home && <span className="building-id">№{t.id + 1}</span>}
-                  <img
-                    className={`tower-art level-${t.level}`}
-                    src={
-                      t.kind === 'gold'
-                        ? '/assets/gold-mine.png'
-                        : t.kind === 'lumber'
-                          ? '/assets/sawmill.png'
-                          : '/assets/tower.png'
-                    }
-                    alt=""
-                    draggable={false}
-                  />
-                  {game.spell && t.home && t.team === game.spell.team && (
-                    <span className="cast-beacon">
-                      <Sparkles size={24} />
-                      <b>
-                        {game.spell.castAt
-                          ? `${Math.max(0, Math.ceil(game.spell.castAt - game.age))} с`
-                          : '✦'}
-                      </b>
-                    </span>
-                  )}
-                  {t.specialty && (
-                    <span
-                      className="specialty-badge"
-                      title={SPECIALTIES[t.specialty]}
-                    >
-                      {t.specialty === 'economy'
-                        ? '◆'
-                        : t.specialty === 'fortress'
-                          ? '⛨'
-                          : t.specialty === 'elite'
-                            ? '★'
-                            : '♟'}
-                    </span>
-                  )}
-                  <span className="tower-number">
-                    {Math.floor(t.count).toLocaleString('ru-RU')}
-                    <small>
-                      {Array.from({ length: t.level }, (_, i) => (
-                        <i key={i} />
-                      ))}
-                    </small>
-                  </span>
-                  {game.automation.some((a) => a.from === t.id) && (
-                    <span className="auto-badge">
-                      <Repeat2 size={12} />
-                    </span>
-                  )}
-                  {t.home && t.team && (
-                    <span
-                      className="hq-nickname"
-                      style={{ color: TEAMS[t.team].color }}
-                    >
-                      {playerName(game, t.team)}
-                      {game.labels?.[t.team] && (
-                        <small className="player-status">
-                          {game.labels[t.team]}
-                        </small>
-                      )}
-                      {game.inputLocked?.[t.team] && (
-                        <small
-                          className="input-lock-status"
-                          title="Мышь и клавиатура отключены"
-                        >
-                          🖱 ⌨ ⊘
-                        </small>
-                      )}
-                    </span>
-                  )}
-                  {t.home &&
-                    t.team &&
-                    !game.hideMessages &&
-                    speech &&
-                    (game.messages ?? [])
-                      .filter((m) => m.team === t.team && m.until > game.age)
-                      .map((m) => (
-                        <span
-                          className="hq-message"
-                          key={`${m.team}-${m.until}`}
-                        >
-                          {m.text}
-                        </span>
-                      ))}
-                  {t.home && (
-                    <span className="hq-label">
-                      <Crown size={12} /> ШТАБ{' '}
-                      <small>
-                        +{(production(t) * game.growth[t.team!]).toFixed(1)}/с
-                      </small>
-                    </span>
-                  )}
-                  {t.kind !== 'tower' && (
-                    <span className="special-label">
-                      {t.kind === 'gold' ? (
-                        <Coins size={15} />
-                      ) : t.kind === 'lumber' ? (
-                        <Trees size={15} />
-                      ) : t.kind === 'relay' ? (
-                        <Radio size={15} />
-                      ) : (
-                        <Package size={15} />
-                      )}{' '}
-                      {KIND_LABEL[t.kind]}
-                      {t.kind === 'gold'
-                        ? ` +${income(t).gold.toFixed(1)}/с`
-                        : t.kind === 'lumber'
-                          ? ` +${income(t).resources.toFixed(1)}/с`
-                          : ''}
-                    </span>
-                  )}
-                  {source?.id === t.id && !t.home && (
-                    <span className="source-label">ВАША БАШНЯ</span>
-                  )}
-                </button>
-              ))}
-
-            </div>
-      {game.event && !game.event.claimed && (
-              <button
-                className="event-beacon"
-                style={{ left: `${game.event.x}%`, top: `${game.event.y}%` }}
-                title="Отправьте отряд или разведчика к событию"
-                onClick={() => {
-                  if (source) {
-                    if (game.event?.kind === 'caravan')
-                      play({
-                        type: 'scout',
-                        from: source.id,
-                        x: game.event.x,
-                        y: game.event.y,
-                      });
-                    else if (game.event?.target !== undefined)
-                      clickTower(game.towers[game.event.target]);
-                  }
-                }}
-              >
-                {game.event.kind === 'deposit'
-                  ? '💎 ×3'
-                  : game.event.kind === 'fortress'
-                    ? '⚑ +50'
-                    : '💰 150'}
-                <small>{Math.ceil(game.event.until - game.age)} с</small>
-              </button>
-            )}
+            <BattlefieldLayer
+              game={game}
+              me={me}
+              selected={selected}
+              speech={speech}
+              routeMode={routeMode}
+              scoutMode={scoutMode}
+              paused={paused}
+              help={help}
+              recording={!!recording}
+              handlers={towerHandlers}
+            />
           </div>
           <div className="field-legend">
             <span>
@@ -1704,7 +1512,7 @@ export default function Home() {
           >
             {speech ? <Volume2 size={18} /> : <VolumeX size={18} />} Реплики
           </button>
-          <TroopLayer game={game} camera={camera} viewport={viewport} speech={speech} paused={paused || help} />
+          <TroopLayer camera={camera} viewport={viewport} speech={speech} paused={paused || help} />
           {!recording && (paused || help || game.result) && (
             <div className="game-overlay">
               <section className="overlay-card">
@@ -2441,8 +2249,13 @@ export default function Home() {
                 : 'Право у лидера по заработку'}
             </p>
           )}
+          {roomError && (
+            <p className="room-error" role="alert">
+              {roomError}
+            </p>
+          )}
           <p className="prompt-feedback" role="status">
-            {promptMessage || roomError}
+            {promptMessage}
           </p>
           {game.decreeLog[0] && (
             <div className="last-decree">
