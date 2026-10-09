@@ -6,7 +6,25 @@ export const ROOM_KEY = 'tower-war:room';
 export const LOCK_KEY = 'tower-war:room:lock';
 
 export const REDIS_MISSING_ERROR =
-  'Общая комната не работает: на Vercel нет Upstash Redis. Откройте Marketplace → Storage → Upstash Redis, подключите к этому проекту (UPSTASH_REDIS_REST_URL и UPSTASH_REDIS_REST_TOKEN) и нажмите Redeploy.';
+  'Общая комната не работает: на Vercel нет Upstash Redis. Подключите Storage к проекту и нажмите Redeploy. Подходят пары UPSTASH_REDIS_REST_URL/TOKEN, STORAGE_REDIS_REST_URL/TOKEN, STORAGE_UPSTASH_REDIS_REST_URL/TOKEN, STORAGE_URL/TOKEN или KV_REST_API_URL/TOKEN.';
+
+/** First complete pair wins. Vercel Storage prefix STORAGE renames the defaults. */
+export const REDIS_ENV_PAIRS = [
+  ['UPSTASH_REDIS_REST_URL', 'UPSTASH_REDIS_REST_TOKEN'],
+  ['STORAGE_REDIS_REST_URL', 'STORAGE_REDIS_REST_TOKEN'],
+  ['STORAGE_UPSTASH_REDIS_REST_URL', 'STORAGE_UPSTASH_REDIS_REST_TOKEN'],
+  ['STORAGE_URL', 'STORAGE_TOKEN'],
+  ['KV_REST_API_URL', 'KV_REST_API_TOKEN'],
+] as const;
+
+export function redisCredentials(): { url: string; token: string } | null {
+  for (const [urlName, tokenName] of REDIS_ENV_PAIRS) {
+    const url = process.env[urlName]?.trim();
+    const token = process.env[tokenName]?.trim();
+    if (url && token) return { url, token };
+  }
+  return null;
+}
 
 const LOCK_PX = 2000;
 const LOCK_ATTEMPTS = 40;
@@ -37,8 +55,7 @@ const globalState = globalThis as typeof globalThis & {
 };
 
 export function storeMode(): 'redis' | 'memory' | 'missing' {
-  if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN)
-    return 'redis';
+  if (redisCredentials()) return 'redis';
   if (process.env.VERCEL === '1') return 'missing';
   return 'memory';
 }
@@ -77,9 +94,9 @@ export function sharedMemoryKv(): Kv {
 }
 
 async function redisCall(command: (string | number)[]): Promise<unknown> {
-  const url = process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (!url || !token) throw new Error('redis env missing');
+  const creds = redisCredentials();
+  if (!creds) throw new Error('redis env missing');
+  const { url, token } = creds;
   const response = await fetch(url, {
     method: 'POST',
     headers: {

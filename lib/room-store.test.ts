@@ -9,33 +9,36 @@ import {
   roomView,
 } from './room';
 import {
+  REDIS_ENV_PAIRS,
   REDIS_MISSING_ERROR,
   ROOM_KEY,
   createMemoryKv,
+  redisCredentials,
   setRoomKvForTests,
   storeMode,
   withLock,
 } from './room-store';
 
-const env = {
-  VERCEL: process.env.VERCEL,
-  URL: process.env.UPSTASH_REDIS_REST_URL,
-  TOKEN: process.env.UPSTASH_REDIS_REST_TOKEN,
-};
+const REDIS_ENV_NAMES = REDIS_ENV_PAIRS.flat();
+
+const savedEnv = new Map<string, string | undefined>(
+  ['VERCEL', ...REDIS_ENV_NAMES].map((name) => [name, process.env[name]]),
+);
 
 function restoreEnv() {
-  if (env.VERCEL === undefined) delete process.env.VERCEL;
-  else process.env.VERCEL = env.VERCEL;
-  if (env.URL === undefined) delete process.env.UPSTASH_REDIS_REST_URL;
-  else process.env.UPSTASH_REDIS_REST_URL = env.URL;
-  if (env.TOKEN === undefined) delete process.env.UPSTASH_REDIS_REST_TOKEN;
-  else process.env.UPSTASH_REDIS_REST_TOKEN = env.TOKEN;
+  for (const [name, value] of savedEnv) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+}
+
+function clearRedisEnv() {
+  for (const name of REDIS_ENV_NAMES) delete process.env[name];
 }
 
 describe('room store', { concurrency: 1 }, () => {
   before(() => {
-    delete process.env.UPSTASH_REDIS_REST_URL;
-    delete process.env.UPSTASH_REDIS_REST_TOKEN;
+    clearRedisEnv();
     delete process.env.VERCEL;
     setRoomKvForTests(null);
   });
@@ -107,11 +110,39 @@ describe('room store', { concurrency: 1 }, () => {
     assert.equal(inside, 0);
   });
 
+  test('any complete redis env pair selects redis and the first pair wins', () => {
+    for (const [urlName, tokenName] of REDIS_ENV_PAIRS) {
+      clearRedisEnv();
+      delete process.env.VERCEL;
+      process.env[urlName] = 'https://example.upstash.io';
+      process.env[tokenName] = 'test-token';
+      assert.equal(storeMode(), 'redis');
+      assert.equal(redisCredentials()?.url, 'https://example.upstash.io');
+    }
+
+    clearRedisEnv();
+    process.env.UPSTASH_REDIS_REST_URL = 'https://first.example';
+    process.env.UPSTASH_REDIS_REST_TOKEN = 'first-token';
+    process.env.STORAGE_URL = 'https://second.example';
+    process.env.STORAGE_TOKEN = 'second-token';
+    assert.equal(redisCredentials()?.url, 'https://first.example');
+
+    clearRedisEnv();
+    process.env.UPSTASH_REDIS_REST_URL = '   ';
+    process.env.UPSTASH_REDIS_REST_TOKEN = 'unused';
+    process.env.STORAGE_URL = 'https://storage.example';
+    process.env.STORAGE_TOKEN = 'storage-token';
+    assert.equal(redisCredentials()?.url, 'https://storage.example');
+
+    clearRedisEnv();
+    delete process.env.VERCEL;
+    assert.equal(storeMode(), 'memory');
+  });
+
   test('vercel without redis refuses a private room', async () => {
     setRoomKvForTests(null);
     process.env.VERCEL = '1';
-    delete process.env.UPSTASH_REDIS_REST_URL;
-    delete process.env.UPSTASH_REDIS_REST_TOKEN;
+    clearRedisEnv();
     assert.equal(storeMode(), 'missing');
     const view = await roomView('seat-1');
     assert.equal(view.code, 'redis_missing');
