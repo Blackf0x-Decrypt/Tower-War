@@ -4,7 +4,7 @@ import type { RoomView } from './room';
 export const ROOM_PROTOCOL_VERSION = 2;
 
 type LobbyState = {
-  seats: { name: string; team: Team; ready: boolean }[];
+  seats: { name: string; team: Team; ready: boolean; away?: boolean }[];
   started: boolean;
   paused: boolean;
   startAt: number | null;

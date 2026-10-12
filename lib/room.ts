@@ -31,10 +31,11 @@ export type Room = {
   troopJournal?: TroopJournal;
 };
 
-const STALE_MS = 120_000;
+export const SEAT_AWAY_MS = 20_000;
+export const SEAT_RELEASE_MS = 180_000;
 
 export type RoomView = {
-  seats?: { name: string; team: Team; ready: boolean }[];
+  seats?: { name: string; team: Team; ready: boolean; away?: boolean }[];
   started?: boolean;
   paused?: boolean;
   startAt?: number | null;
@@ -168,18 +169,15 @@ function noteSeen(current: Room, playerId: string | null | undefined, now: numbe
   if (seat) seat.seen = now;
 }
 
-function dropStale(current: Room, now: number) {
-  if (current.started) return;
-  const gone = current.seats.filter((s) => now - s.seen > STALE_MS);
-  if (!gone.length) return;
-  current.seats = current.seats.filter((s) => now - s.seen <= STALE_MS);
+function releaseSeat(current: Room, seat: Seat, now: number) {
+  current.seats = current.seats.filter((s) => s.id !== seat.id);
   if (current.started) {
-    const left = new Set(gone.map((s) => s.team));
     const spell = current.game.spell;
     current.game = {
       ...current.game,
-      humans: (current.game.humans ?? []).filter((t) => !left.has(t)),
-      spell: spell && left.has(spell.team) && !spell.patch ? undefined : spell,
+      humans: (current.game.humans ?? []).filter((t) => t !== seat.team),
+      spell:
+        spell && spell.team === seat.team && !spell.patch ? undefined : spell,
     };
   }
   if (!current.seats.length) {
@@ -192,6 +190,11 @@ function dropStale(current: Room, now: number) {
   syncReady(current);
 }
 
+function dropStale(current: Room, now: number) {
+  const gone = current.seats.filter((s) => now - s.seen > SEAT_RELEASE_MS);
+  for (const seat of gone) releaseSeat(current, seat, now);
+}
+
 export function prepare(current: Room, playerId: string | null | undefined, now: number) {
   noteSeen(current, playerId, now);
   advance(current, now);
@@ -199,10 +202,15 @@ export function prepare(current: Room, playerId: string | null | undefined, now:
   launch(current, now);
 }
 
-function viewOf(current: Room, playerId: string | null): RoomView {
+function viewOf(current: Room, playerId: string | null, now = Date.now()): RoomView {
   const seat = current.seats.find((s) => s.id === playerId);
   return {
-    seats: current.seats.map(({ name, team, ready }) => ({ name, team, ready })),
+    seats: current.seats.map(({ name, team, ready, seen }) => ({
+      name,
+      team,
+      ready,
+      ...(now - seen > SEAT_AWAY_MS ? { away: true } : {}),
+    })),
     started: current.started,
     paused: current.paused,
     startAt: current.started ? null : current.startAt,
@@ -281,7 +289,7 @@ export async function roomView(playerId: string | null): Promise<RoomView> {
   try {
     return await editRoom((current, now) => {
       prepare(current, playerId, now);
-      return viewOf(current, playerId);
+      return viewOf(current, playerId, now);
     }, 1);
   } catch (error) {
     if (!(error instanceof RoomBusyError)) throw error;
@@ -314,14 +322,18 @@ export async function roomCommand(body: {
           const name = String(body.name || '').trim().slice(0, 16);
           if (name) existing.name = name;
           return {
-            ...viewOf(current, existing.id),
+            ...viewOf(current, existing.id, now),
             playerId: existing.id,
             team: existing.team,
           };
         }
       }
       if (current.started)
-        return { error: 'Матч уже идёт. Дождитесь конца или сброса.' };
+        return {
+          error: body.playerId
+            ? 'Место освобождено: связи не было больше 3 минут.'
+            : 'Матч уже идёт. Дождитесь конца или сброса.',
+        };
       if (!isTeam(body.team)) return { error: 'Нет такого цвета.' };
       if (current.seats.some((s) => s.team === body.team))
         return { error: 'Этот цвет уже занят.' };
@@ -335,33 +347,14 @@ export async function roomCommand(body: {
       };
       current.seats.push(seat);
       syncReady(current);
-      return { ...viewOf(current, seat.id), playerId: seat.id, team: seat.team };
+      return { ...viewOf(current, seat.id, now), playerId: seat.id, team: seat.team };
     }
     const seat = current.seats.find((s) => s.id === body.playerId);
     if (!seat) return { error: 'Сначала выберите цвет.' };
     seat.seen = now;
     if (op === 'leave') {
-      current.seats = current.seats.filter((s) => s.id !== seat.id);
-      if (current.started) {
-        const spell = current.game.spell;
-        current.game = {
-          ...current.game,
-          humans: (current.game.humans ?? []).filter((t) => t !== seat.team),
-          spell:
-            spell && spell.team === seat.team && !spell.patch
-              ? undefined
-              : spell,
-        };
-      }
-      if (!current.seats.length) {
-        current.started = false;
-        current.paused = false;
-        current.game = initialGame();
-        current.clock = now;
-        current.startAt = null;
-      }
-      syncReady(current);
-      return viewOf(current, null);
+      releaseSeat(current, seat, now);
+      return viewOf(current, null, now);
     }
     if (op === 'ready') {
       if (!current.started) seat.ready = !seat.ready;

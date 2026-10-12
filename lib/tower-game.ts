@@ -887,6 +887,23 @@ function insertById(list: Tower[], tower: Tower) {
   while (i < list.length && list[i].id < tower.id) i++;
   list.splice(i, 0, tower);
 }
+// Alive means an owned standing building. Garrison 0 is not death: a player
+// can march every soldier out and reinforce later. A ruin is not standing.
+export function teamAlive(g: Game, team: Team): boolean {
+  for (const t of g.towers) {
+    if (t.team === team && t.ruinedAt === undefined) return true;
+  }
+  return false;
+}
+function addGarrison(t: Tower, amount: number) {
+  if (t.ruinedAt !== undefined) {
+    t.team = null;
+    return false;
+  }
+  if (!t.team || !Number.isFinite(amount) || amount === 0) return false;
+  t.count = Math.max(0, Math.min(1e9, t.count + amount));
+  return true;
+}
 export function refreshAuthority(g: Game): Game {
   const next = leader(g);
   if (next === g.authority) return g;
@@ -958,6 +975,10 @@ export function tick(previous: Game, dt = 0.05): Game {
       t.count = 0;
       t.stockGold = 0;
       t.stockWood = 0;
+    }
+    if (t.ruinedAt !== undefined) {
+      t.team = null;
+      continue;
     }
     if (!t.team || (g.frozen?.[t.team] ?? 0) > g.age) continue;
     const w = g.wallets[t.team],
@@ -1237,8 +1258,7 @@ export function tick(previous: Game, dt = 0.05): Game {
       }
       continue;
     }
-    if (target.team === p.team)
-      target.count = Math.min(1e9, target.count + p.strength);
+    if (target.team === p.team) addGarrison(target, p.strength);
     else if (target.team && (g.shielded?.[target.team] ?? 0) > g.age) {
     } else if (target.home && !g.allowHeadquartersCapture)
       target.count = Math.max(0, target.count - p.strength * (p.elite ? 2 : 1));
@@ -1505,15 +1525,7 @@ export function tick(previous: Game, dt = 0.05): Game {
     }
   }
   if (g.age >= DEVELOPMENT_SECONDS) {
-    const present: Record<Team, boolean> = {
-      you: false,
-      red: false,
-      purple: false,
-      green: false,
-    };
-    for (const t of g.towers) if (t.team) present[t.team] = true;
-    for (const p of g.troops) present[p.team] = true;
-    const alive = TEAM_IDS.filter((team) => present[team]);
+    const alive = TEAM_IDS.filter((team) => teamAlive(g, team));
     if (alive.length === 1) g.result = alive[0];
   }
   if (g.elapsed >= DURATION - 1e-4 && !g.result)
@@ -1627,18 +1639,19 @@ export function applyDecree(
         t.level = Math.max(1, Math.min(10, Math.floor(a.amount)));
       log.push(`Уровень зданий: ${a.amount}`);
     } else {
-      for (const t of targets)
-        t.count = Math.max(
-          0,
-          Math.min(
-            1e9,
-            a.kind === 'set'
-              ? a.amount
-              : a.kind === 'multiply'
-                ? t.count * a.amount
-                : t.count + a.amount,
-          ),
-        );
+      for (const t of targets) {
+        if (t.ruinedAt !== undefined) {
+          t.team = null;
+          continue;
+        }
+        const next =
+          a.kind === 'set'
+            ? a.amount
+            : a.kind === 'multiply'
+              ? t.count * a.amount
+              : t.count + a.amount;
+        t.count = Math.max(0, Math.min(1e9, next));
+      }
       if (a.kind === 'multiply')
         for (const troop of next.troops)
           if (troopMatches(troop))

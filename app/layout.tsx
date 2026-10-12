@@ -14,7 +14,8 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: 'Forge of Will — Солнечная долина',
-  description: 'Захватывайте башни, отправляйте отряды и управляйте снабжением в красочной стратегии против ботов.',
+  description:
+    'Захватывайте башни и отправляйте отряды. Свободный цвет может занять друг. Пустой цвет к старту играет бот.',
 };
 
 export default function RootLayout({

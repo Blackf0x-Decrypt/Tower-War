@@ -19,7 +19,16 @@ import {
   storeMode,
   withLock,
 } from './room-store';
-import { initialGame, tick } from './tower-game';
+import {
+  DEVELOPMENT_SECONDS,
+  applyDecree,
+  initialGame,
+  recallTroops,
+  sendArmy,
+  teamAlive,
+  tick,
+} from './tower-game';
+import { SEAT_AWAY_MS, SEAT_RELEASE_MS } from './room';
 import { battleRenderInput, reactStamp, skipBattleRender } from './live-view';
 import {
   applyRoomTransport,
@@ -710,5 +719,447 @@ describe('room store', { concurrency: 1 }, () => {
     assert.equal(game.spell, undefined);
     const gold = game.towers.find((tower) => tower.kind === 'gold' && tower.team === 'you')!;
     assert.equal(gold.count, goldBefore);
+  });
+});
+
+describe('match end', () => {
+  function withAge(game: ReturnType<typeof initialGame>, age: number) {
+    return { ...game, age, elapsed: age, troops: [] as typeof game.troops };
+  }
+
+  test('after 4:00 only one team with buildings wins, and gold 0 with an HQ does not', () => {
+    const opened = initialGame();
+    const sole = tick(
+      withAge(
+        {
+          ...opened,
+          towers: opened.towers.map((tower) =>
+            tower.home === 'red' || tower.team === 'red'
+              ? { ...tower, team: 'red' as const, count: Math.max(tower.count, 8) }
+              : { ...tower, team: null, home: undefined, count: 0 },
+          ),
+        },
+        DEVELOPMENT_SECONDS,
+      ),
+      0.05,
+    );
+    assert.equal(sole.result, 'red');
+    assert.equal(teamAlive(sole, 'red'), true);
+    assert.equal(teamAlive(sole, 'you'), false);
+
+    const early = tick(
+      withAge(
+        {
+          ...opened,
+          towers: opened.towers.map((tower) =>
+            tower.home === 'red' || tower.team === 'red'
+              ? { ...tower, team: 'red' as const, count: Math.max(tower.count, 8) }
+              : { ...tower, team: null, home: undefined, count: 0 },
+          ),
+        },
+        DEVELOPMENT_SECONDS - 30,
+      ),
+      0.05,
+    );
+    assert.ok(early.age < DEVELOPMENT_SECONDS);
+    assert.equal(early.result, null);
+
+    const gone = {
+      ...opened,
+      towers: opened.towers.map((tower) =>
+        tower.team === 'you' || tower.home === 'you'
+          ? { ...tower, team: null, home: undefined, count: 0 }
+          : tower,
+      ),
+    };
+    assert.equal(teamAlive(gone, 'you'), false);
+
+    const funded = withAge(
+      {
+        ...opened,
+        wallets: {
+          ...opened.wallets,
+          you: { ...opened.wallets.you, gold: 0 },
+        },
+        towers: opened.towers.map((tower) =>
+          tower.home ? { ...tower, team: tower.home, count: 12 } : tower,
+        ),
+      },
+      DEVELOPMENT_SECONDS,
+    );
+    assert.equal(funded.wallets.you.gold, 0);
+    assert.equal(teamAlive(funded, 'you'), true);
+    assert.equal(tick(funded, 0.05).result, null);
+
+    const emptyHq = withAge(
+      {
+        ...opened,
+        authority: 'you' as const,
+        authorityEpoch: 3,
+        humans: ['you', 'red', 'purple', 'green'] as const,
+        wallets: {
+          ...opened.wallets,
+          you: { gold: 0, resources: 0, earned: 400 },
+        },
+        towers: opened.towers.map((tower) => {
+          if (tower.home === 'you') return { ...tower, team: 'you' as const, count: 0 };
+          if (tower.home) return { ...tower, team: tower.home, count: 20 };
+          return tower;
+        }),
+      },
+      DEVELOPMENT_SECONDS,
+    );
+    assert.equal(emptyHq.wallets.you.gold, 0);
+    assert.equal(teamAlive(emptyHq, 'you'), true);
+    assert.equal(
+      teamAlive(
+        {
+          ...emptyHq,
+          towers: emptyHq.towers.map((tower) =>
+            tower.home === 'you' ? { ...tower, count: 0.4 } : tower,
+          ),
+        },
+        'you',
+      ),
+      true,
+    );
+    assert.equal(tick(emptyHq, 0.05).result, null);
+    const reinforced = applyDecree(
+      emptyHq,
+      'you',
+      { kind: 'reinforce', target: 'main', amount: 12 },
+      3,
+    );
+    const reinforcedHq = reinforced.towers.find((tower) => tower.home === 'you')!;
+    assert.ok(reinforcedHq.count >= 12, `reinforced ${reinforcedHq.count}`);
+    const ruined = {
+      ...emptyHq,
+      towers: emptyHq.towers.map((tower) =>
+        tower.home === 'you' ? { ...tower, ruinedAt: 1, count: 0 } : tower,
+      ),
+    };
+    assert.equal(teamAlive(ruined, 'you'), false);
+    const denied = applyDecree(
+      ruined,
+      'you',
+      { kind: 'reinforce', target: 'main', amount: 12 },
+      3,
+    );
+    const ruinedHq = denied.towers.find((tower) => tower.home === 'you')!;
+    assert.equal(ruinedHq.count, 0);
+    assert.equal(ruinedHq.team, null);
+    const wiped = withAge(
+      {
+        ...opened,
+        towers: opened.towers.map((tower) => {
+          if (tower.home === 'you' || tower.team === 'you')
+            return { ...tower, team: 'you' as const, count: 8, ruinedAt: 1 };
+          if (tower.home) return { ...tower, team: 'red' as const, home: 'red' as const, count: 20 };
+          return { ...tower, team: null, count: 0 };
+        }),
+      },
+      DEVELOPMENT_SECONDS,
+    );
+    assert.equal(teamAlive(wiped, 'you'), false);
+    assert.equal(tick(wiped, 0.05).result, 'red');
+
+    const barracks = opened.towers.find((tower) => tower.kind === 'barracks' && tower.x < 50)!;
+    const hq = opened.towers.find((tower) => tower.home === 'you')!;
+    let returning = {
+      ...opened,
+      humans: ['you', 'red', 'purple', 'green'] as const,
+      towers: opened.towers.map((tower) => {
+        if (tower.id === hq.id) return { ...tower, count: 0 };
+        if (tower.id === barracks.id) return { ...tower, team: 'you' as const, count: 16 };
+        return tower;
+      }),
+    };
+    returning = sendArmy(returning, barracks.id, hq.id, 1);
+    returning = {
+      ...returning,
+      troops: returning.troops.map((troop) => ({ ...troop, progress: 0.999, delay: 0 })),
+    };
+    returning = tick(returning, 0.05);
+    assert.ok(
+      returning.towers.find((tower) => tower.id === hq.id)!.count >= 1,
+      'arrival onto 0',
+    );
+    let recalled = sendArmy(
+      {
+        ...opened,
+        towers: opened.towers.map((tower) =>
+          tower.id === hq.id ? { ...tower, count: 10 } : tower,
+        ),
+      },
+      hq.id,
+      barracks.id,
+      1,
+    );
+    recalled = {
+      ...recalled,
+      towers: recalled.towers.map((tower) =>
+        tower.id === hq.id ? { ...tower, count: 0 } : tower,
+      ),
+    };
+    recalled = recallTroops(recalled, 'you', hq.id, null);
+    assert.ok(recalled.towers.find((tower) => tower.id === hq.id)!.count >= 1, 'recall onto 0');
+    const gold = opened.towers.find((tower) => tower.kind === 'gold')!;
+    let regen = {
+      ...emptyHq,
+      towers: emptyHq.towers.map((tower) =>
+        tower.id === gold.id ? { ...tower, team: 'you' as const, count: 0 } : tower,
+      ),
+    };
+    for (let i = 0; i < 40; i++) regen = tick(regen, 0.05);
+    assert.ok(regen.towers.find((tower) => tower.id === hq.id)!.count >= 1, 'hq recruits from 0');
+    assert.equal(regen.towers.find((tower) => tower.id === gold.id)!.count, 0);
+  });
+});
+
+describe('seat release and four players', { concurrency: 1 }, () => {
+  before(() => {
+    clearRedisEnv();
+    delete process.env.VERCEL;
+    setRoomKvForTests(null);
+  });
+
+  after(() => {
+    setRoomKvForTests(null);
+    restoreEnv();
+  });
+
+  function memory() {
+    const kv = createMemoryKv();
+    setRoomKvForTests(kv);
+    return kv;
+  }
+
+  async function ageSeat(
+    kv: ReturnType<typeof createMemoryKv>,
+    id: string,
+    ageMs: number,
+  ) {
+    const room = roomFromJson((await kv.get(ROOM_KEY))!);
+    const seat = room.seats.find((item) => item.id === id);
+    assert.ok(seat);
+    seat.seen = Date.now() - ageMs;
+    await kv.set(ROOM_KEY, roomToJson(room));
+  }
+
+  async function saveGame(
+    kv: ReturnType<typeof createMemoryKv>,
+    edit: (room: ReturnType<typeof roomFromJson>) => void,
+  ) {
+    const room = roomFromJson((await kv.get(ROOM_KEY))!);
+    edit(room);
+    await kv.set(ROOM_KEY, roomToJson(room));
+    return room;
+  }
+
+  test('active seat stays, reload reclaims, one miss does not release, stale frees the color', async () => {
+    const kv = memory();
+    const joined = await roomCommand({ op: 'join', team: 'you', name: 'Анна' });
+    assert.equal(joined.error, undefined);
+    const id = joined.playerId!;
+    const live = await roomView(id);
+    assert.equal(live.you?.team, 'you');
+    assert.equal(live.seats?.length, 1);
+
+    const reloaded = await roomCommand({
+      op: 'join',
+      playerId: id,
+      team: 'red',
+      name: 'Анна',
+    });
+    assert.equal(reloaded.playerId, id);
+    assert.equal(reloaded.you?.team, 'you');
+
+    await ageSeat(kv, id, 1000);
+    const missed = await roomView(null);
+    assert.equal(missed.seats?.length, 1);
+    assert.equal(missed.seats?.[0].away, undefined);
+
+    await ageSeat(kv, id, SEAT_AWAY_MS + 1000);
+    const away = await roomView(null);
+    assert.equal(away.seats?.length, 1);
+    assert.equal(away.seats?.[0].away, true);
+    const blocked = await roomCommand({ op: 'join', team: 'you', name: 'Борис' });
+    assert.match(blocked.error || '', /занят/);
+    const reclaimed = await roomCommand({
+      op: 'join',
+      playerId: id,
+      team: 'you',
+      name: 'Анна',
+    });
+    assert.equal(reclaimed.playerId, id);
+
+    await ageSeat(kv, id, SEAT_RELEASE_MS + 1000);
+    const freed = await roomView(null);
+    assert.equal(freed.seats?.length, 0);
+    const newbie = await roomCommand({ op: 'join', team: 'you', name: 'Борис' });
+    assert.equal(newbie.error, undefined);
+    assert.notEqual(newbie.playerId, id);
+    const left = await roomCommand({ op: 'leave', playerId: newbie.playerId });
+    assert.equal(left.seats?.length, 0);
+  });
+
+  test('a started match releases a stale seat and does not let a stranger take it', async () => {
+    const kv = memory();
+    const anna = await roomCommand({ op: 'join', team: 'you', name: 'Анна' });
+    const boris = await roomCommand({ op: 'join', team: 'red', name: 'Борис' });
+    await roomCommand({ op: 'ready', playerId: anna.playerId });
+    await roomCommand({ op: 'ready', playerId: boris.playerId });
+    await saveGame(kv, (room) => {
+      room.startAt = Date.now() - 5;
+    });
+    const started = await roomView(boris.playerId!);
+    assert.equal(started.started, true);
+    await ageSeat(kv, anna.playerId!, 1000);
+    const still = await roomView(boris.playerId!);
+    assert.equal(still.seats?.some((seat) => seat.team === 'you'), true);
+    await ageSeat(kv, anna.playerId!, SEAT_RELEASE_MS + 5000);
+    const released = await roomView(boris.playerId!);
+    assert.equal(released.started, true);
+    assert.equal(released.seats?.some((seat) => seat.team === 'you'), false);
+    assert.equal(released.seats?.some((seat) => seat.team === 'red'), true);
+    assert.equal(released.game?.humans?.includes('you'), false);
+    const stranger = await roomCommand({ op: 'join', team: 'you', name: 'Вор' });
+    assert.match(stranger.error || '', /Матч уже идёт/);
+    const reclaim = await roomCommand({
+      op: 'join',
+      playerId: anna.playerId,
+      team: 'you',
+      name: 'Анна',
+    });
+    assert.match(reclaim.error || '', /освобождено/);
+  });
+
+  test('four seats join, reload, attack, decree, and one team death', async () => {
+    const kv = memory();
+    const names = [
+      ['you', 'Синий'],
+      ['red', 'Красный'],
+      ['purple', 'Фиолетовый'],
+      ['green', 'Зелёный'],
+    ] as const;
+    const ids: string[] = [];
+    for (const [team, name] of names) {
+      const joined = await roomCommand({ op: 'join', team, name });
+      assert.equal(joined.error, undefined, joined.error);
+      ids.push(joined.playerId!);
+    }
+    for (const id of ids) {
+      const ready = await roomCommand({ op: 'ready', playerId: id });
+      assert.equal(ready.error, undefined);
+    }
+    await saveGame(kv, (room) => {
+      room.startAt = Date.now() - 5;
+    });
+    const opened = await roomView(ids[0]);
+    assert.equal(opened.started, true);
+    assert.equal(opened.seats?.length, 4);
+
+    const reloaded = await roomCommand({
+      op: 'join',
+      playerId: ids[0],
+      team: 'red',
+      name: 'Синий',
+    });
+    assert.equal(reloaded.playerId, ids[0]);
+    assert.equal(reloaded.you?.team, 'you');
+
+    const before = roomFromJson((await kv.get(ROOM_KEY))!).game;
+    const source = before.towers.find((tower) => tower.home === 'you')!;
+    const target = before.towers.find((tower) => !tower.team && tower.kind === 'gold')!;
+    const sourceCount = source.count;
+    const attack = await roomCommand({
+      op: 'action',
+      playerId: ids[0],
+      action: { type: 'army', from: source.id, to: target.id, fraction: 0.5 },
+    });
+    assert.equal(attack.error, undefined, attack.error);
+    await roomCommand({ op: 'pause', playerId: ids[1], paused: true });
+    const attackViews = await Promise.all(ids.map((id) => roomView(id)));
+    assert.ok(attackViews.every((view) => view.revision === attackViews[0].revision));
+    assert.ok(
+      attackViews.every((view) => {
+        const tower = view.game?.towers.find((item) => item.id === source.id);
+        return (
+          (view.game?.troops.length ?? 0) > 0 &&
+          (tower?.count ?? sourceCount) < sourceCount
+        );
+      }),
+    );
+
+    await saveGame(kv, (room) => {
+      room.paused = false;
+      room.clock = Date.now();
+      room.game.age = DEVELOPMENT_SECONDS;
+      room.game.elapsed = DEVELOPMENT_SECONDS;
+      room.game.authority = null;
+      room.game.wallets.you.earned = 900;
+      room.game.wallets.red.earned = 1;
+      room.game.wallets.purple.earned = 1;
+      room.game.wallets.green.earned = 1;
+    });
+    const spell = await roomCommand({
+      op: 'action',
+      playerId: ids[0],
+      action: { type: 'spell-start', text: 'штабу +20', roll: 'disabled' },
+    });
+    assert.equal(typeof spell.spellNonce, 'number');
+    assert.equal(typeof spell.spellEpoch, 'number');
+    const armed = await roomCommand({
+      op: 'action',
+      playerId: ids[0],
+      action: {
+        type: 'spell-ready',
+        patch: { kind: 'reinforce', target: 'main', amount: 20 },
+        epoch: spell.spellEpoch!,
+        debuff: null,
+        roll: 'disabled',
+      },
+    });
+    assert.equal(armed.error, undefined, armed.error);
+    const hqBefore = roomFromJson((await kv.get(ROOM_KEY))!).game.towers.find(
+      (tower) => tower.home === 'you',
+    )!.count;
+    await saveGame(kv, (room) => {
+      const castAt = room.game.spell?.castAt ?? room.game.age;
+      room.game.age = castAt;
+      room.clock = Date.now() - 120;
+      room.paused = false;
+    });
+    const cast = await roomView(ids[0]);
+    const hqAfter = cast.game?.towers.find((tower) => tower.home === 'you')!.count ?? 0;
+    assert.ok(hqAfter >= hqBefore + 20, `decree ${hqBefore} -> ${hqAfter}`);
+    await roomCommand({ op: 'pause', playerId: ids[2], paused: true });
+    const decreeViews = await Promise.all(ids.map((id) => roomView(id)));
+    assert.ok(decreeViews.every((view) => view.revision === decreeViews[0].revision));
+    assert.ok(
+      decreeViews.every(
+        (view) =>
+          (view.game?.towers.find((tower) => tower.home === 'you')?.count ?? 0) >=
+          hqBefore + 20,
+      ),
+    );
+
+    await saveGame(kv, (room) => {
+      room.paused = false;
+      room.clock = Date.now() - 120;
+      room.game.age = DEVELOPMENT_SECONDS;
+      room.game.elapsed = DEVELOPMENT_SECONDS;
+      room.game.result = null;
+      room.game.towers = room.game.towers.map((tower) =>
+        tower.team === 'red' || tower.home === 'red'
+          ? { ...tower, team: 'red' as const, home: tower.home ? ('red' as const) : tower.home, count: Math.max(tower.count, 8), ruinedAt: undefined }
+          : { ...tower, team: null, home: undefined, count: 0, ruinedAt: room.game.age },
+      );
+    });
+    const ended = await roomView(ids[1]);
+    assert.equal(ended.game?.result, 'red');
+    const endViews = await Promise.all(ids.map((id) => roomView(id)));
+    assert.ok(endViews.every((view) => view.game?.result === 'red'));
+    assert.ok(endViews.every((view) => view.revision === endViews[0].revision));
   });
 });

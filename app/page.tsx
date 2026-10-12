@@ -144,7 +144,7 @@ export default function Home() {
   const [picked, setPicked] = useState<Team>('you');
   const [roomError, setRoomError] = useState('');
   const [lobby, setLobby] = useState<{
-    seats: { name: string; team: Team; ready: boolean }[];
+    seats: { name: string; team: Team; ready: boolean; away?: boolean }[];
     started: boolean;
     paused: boolean;
     startAt: number | null;
@@ -329,7 +329,6 @@ export default function Home() {
         setRoomError('');
         if (message.transport === 'noop') return;
         if (id && seatRef.current?.id === id && !data.you) {
-          if (message.transport !== 'full') return;
           if (data.started) {
             const saved = readSavedSeat();
             if (saved && misses < 1) {
@@ -352,14 +351,28 @@ export default function Home() {
                   transport?: RoomTransport;
                 };
                 if (body.transport) ingestRef.current(body.transport);
-                if (body.playerId) return;
-                if (body.error) setRoomError(body.error);
+                if (body.playerId === saved.playerId) return;
+                setRoomError(
+                  body.error ||
+                    'Место освобождено: связи не было больше 3 минут.',
+                );
               }
+            } else {
+              setRoomError('Место освобождено: связи не было больше 3 минут.');
             }
+            writeSavedSeat(null);
+            sharedRef.current = false;
+            seatRef.current = null;
+            transportRef.current = null;
+            setSeat(null);
+            setResuming(false);
+            setStarted(false);
+            setLobby(data);
             return;
           }
           misses += 1;
           if (misses < 3) return;
+          setRoomError('Место освобождено: связи не было больше 3 минут.');
           writeSavedSeat(null);
           sharedRef.current = false;
           seatRef.current = null;
@@ -791,6 +804,24 @@ export default function Home() {
     setResuming(false);
     writeSavedSeat({ playerId: data.playerId, team: data.team, name });
   }
+  async function releaseSeat() {
+    if (!seatRef.current) return;
+    setRoomError('');
+    const data = await roomPost({ op: 'leave', playerId: seatRef.current.id });
+    if (data.error) {
+      setRoomError(data.error);
+      return;
+    }
+    writeSavedSeat(null);
+    seatRef.current = null;
+    transportRef.current = null;
+    sharedRef.current = false;
+    setSeat(null);
+    setResuming(false);
+    setStarted(false);
+    setPaused(false);
+    pushGame(initialGame(), true);
+  }
   async function toggleReady() {
     if (!seatRef.current) return;
     setRoomError('');
@@ -1101,9 +1132,11 @@ export default function Home() {
                         ? 'готов'
                         : 'вы'
                       : taken
-                        ? taken.ready
-                          ? `${taken.name} · готов`
-                          : taken.name
+                        ? taken.away
+                          ? `${taken.name} · нет связи`
+                          : taken.ready
+                            ? `${taken.name} · готов`
+                            : taken.name
                         : 'свободен'}
                   </small>
                 </button>
@@ -1112,12 +1145,17 @@ export default function Home() {
           </div>
           {roomError && <p className="room-error">{roomError}</p>}
           {seat ? (
-            <button
-              className={`play-button ${lobby?.you?.ready ? 'is-ready' : ''}`}
-              onClick={() => void toggleReady()}
-            >
-              <Check /> {lobby?.you?.ready ? 'Отменить готовность' : 'Готов'}
-            </button>
+            <>
+              <button
+                className={`play-button ${lobby?.you?.ready ? 'is-ready' : ''}`}
+                onClick={() => void toggleReady()}
+              >
+                <Check /> {lobby?.you?.ready ? 'Отменить готовность' : 'Готов'}
+              </button>
+              <button className="solo-button" onClick={() => void releaseSeat()}>
+                Освободить место
+              </button>
+            </>
           ) : (
             <button className="play-button" onClick={() => void sit(picked)}>
               <Play fill="currentColor" /> Сесть за {TEAMS[picked].name}
@@ -1132,7 +1170,7 @@ export default function Home() {
                 <li key={s.team}>
                   <i style={{ background: TEAMS[s.team].color }} />
                   {s.name}
-                  <b>{s.ready ? 'готов' : 'ждёт'}</b>
+                  <b>{s.away ? 'нет связи' : s.ready ? 'готов' : 'ждёт'}</b>
                 </li>
               ))}
             </ul>
@@ -1142,7 +1180,7 @@ export default function Home() {
               ? `Все готовы. Общий старт через ${Math.max(1, Math.ceil((lobby.startAt - (clock || Date.now())) / 1000))} с.`
               : (lobby?.seats.length ?? 0) < 2
                 ? 'Нужны минимум двое. Каждый выбирает свой цвет и нажимает «Готов».'
-                : 'Бой начнётся, когда готов каждый, кто сел за стол. Пустые цвета остаются ботами.'}
+                : 'Бой начнётся, когда готов каждый, кто сел за стол. Свободный цвет может занять друг. Пустой цвет станет ботом, только если к старту в нём нет человека.'}
           </p>
           <div className="start-rules">
             <span>
@@ -1557,8 +1595,9 @@ export default function Home() {
                     </ul>
                     <p>
                       Двигайте карту мышью или пальцем, масштаб — колесом.
-                      События дают временные бонусы. Матч — 12 минут; стартовых
-                      соперников трое, все боты.
+                      События дают временные бонусы. Матч — 12 минут. Свободный
+                      цвет может занять друг. Цвет без человека к старту играет
+                      бот.
                     </p>
                     <button className="primary" onClick={() => setHelp(false)}>
                       Понятно, в бой! <ChevronRight size={18} />
@@ -1631,6 +1670,11 @@ export default function Home() {
                     >
                       Продолжить <Play size={18} />
                     </button>
+                    {seat && (
+                      <button className="solo-button" onClick={() => void releaseSeat()}>
+                        Освободить место
+                      </button>
+                    )}
                   </>
                 )}
               </section>
@@ -2298,8 +2342,8 @@ export default function Home() {
         </span>
         <small>
           {(game.humans?.length ?? 1) > 1
-            ? 'Пустые цвета играют боты'
-            : 'Противники — боты'}
+            ? 'Пустой цвет — бот, пока в нём нет человека'
+            : 'Свободный цвет может занять друг. Пустой к старту — бот'}
         </small>
       </footer>
     </main>

@@ -33,7 +33,7 @@ export const TroopLayer = memo(function TroopLayer({camera, viewport, speech, pa
     troops:[] as Troop[], towers:[] as Tower[], shots:[] as Shot[], age:0, hideMessages:false, gen:0,
     camera,viewport,speech,paused,at:0,interval:50,previous:previous.current,
   });
-  const painted = useRef({x:Number.NaN,y:Number.NaN,z:Number.NaN,w:0,h:0,gen:-1,speech:false,paused:false,hop:-1});
+  const painted = useRef({x:Number.NaN,y:Number.NaN,z:Number.NaN,w:0,h:0,gen:-1,speech:false,paused:false,settled:false});
   useEffect(()=> {
     frame.current.camera=camera;
     frame.current.viewport=viewport;
@@ -64,8 +64,7 @@ export const TroopLayer = memo(function TroopLayer({camera, viewport, speech, pa
     wake.current();
   }),[paused]);
   useEffect(()=> {
-    let id=0,disposed=false,lastPaint=0;
-    const reducedMotion=window.matchMedia('(prefers-reduced-motion: reduce)');
+    let id=0,disposed=false;
     const source=new Image();
     const sprites:Record<string,HTMLCanvasElement>={};
     const dash=[10,8];
@@ -119,26 +118,24 @@ export const TroopLayer = memo(function TroopLayer({camera, viewport, speech, pa
         const ratio=Math.min(window.devicePixelRatio||1,1.5), zoom=f.camera.zoom;
         const width=Math.max(1,Math.round(f.viewport.w*ratio)),height=Math.max(1,Math.round(f.viewport.h*ratio));
         const blend=f.paused?1:Math.min(1,(now-f.at)/f.interval);
-        const moving=blend<1 && !f.paused;
-        const mark=painted.current;
-        const same=f.camera.x===mark.x && f.camera.y===mark.y && zoom===mark.z && f.viewport.w===mark.w && f.viewport.h===mark.h && f.gen===mark.gen && f.speech===mark.speech && f.paused===mark.paused && el.width===width && el.height===height;
-        const animated=!f.paused && !reducedMotion.matches && f.troops.some(p=>p.delay<=0);
-        let paint=true;
-        if(same && !moving) {
-          if(!animated) paint=false;
-          else {
-            const hop=(now/16)|0;
-            if(hop===mark.hop) paint=false;
+        let stepping=false;
+        if(!f.paused && blend<1){
+          for(const p of f.troops){
+            if(p.delay>0) continue;
+            const old=f.previous.get(p.id);
+            if(old && (old.x!==p.x || old.y!==p.y)){ stepping=true; break; }
           }
         }
-        if(paint && animated && now-lastPaint<16) paint=false;
+        const mark=painted.current;
+        const same=f.camera.x===mark.x && f.camera.y===mark.y && zoom===mark.z && f.viewport.w===mark.w && f.viewport.h===mark.h && f.gen===mark.gen && f.speech===mark.speech && f.paused===mark.paused && el.width===width && el.height===height;
+        const settled=!stepping;
+        let paint=true;
+        if(same && settled && mark.settled) paint=false;
         if(paint) {
-          lastPaint=now;
           if(el.width!==width||el.height!==height){el.width=width;el.height=height;}
           const ctx=el.getContext('2d');
           if(ctx){
             ctx.setTransform(ratio,0,0,ratio,0,0);ctx.clearRect(0,0,f.viewport.w,f.viewport.h);
-            const motion=f.paused?f.age:now/1000;
             const towers=f.towers;
             ctx.save();
             ctx.lineCap='round';
@@ -211,10 +208,8 @@ export const TroopLayer = memo(function TroopLayer({camera, viewport, speech, pa
               }
               ctx.fillStyle='#3b572d38';ctx.beginPath();ctx.ellipse(0,0,11,4,0,0,Math.PI*2);ctx.fill();
               if(p.cargo){
-                const spin=reducedMotion.matches?p.id:motion*8+p.id*1.7;
-                const bob=reducedMotion.matches?0:Math.sin(motion*5+p.id*1.3)*3;
-                ctx.translate(0,-8+bob);
-                drawWheel(-10,spin);drawWheel(10,spin);
+                ctx.translate(0,-8);
+                drawWheel(-10,0);drawWheel(10,0);
                 ctx.fillStyle='#8a552c';ctx.strokeStyle='#5c3818';ctx.lineWidth=1.5;
                 ctx.beginPath();ctx.roundRect(-16,-8,32,16,3);ctx.fill();ctx.stroke();
                 ctx.fillStyle=p.haul?.resources&&!p.haul.gold?'#6fa84a':'#f0c14a';
@@ -224,11 +219,9 @@ export const TroopLayer = memo(function TroopLayer({camera, viewport, speech, pa
                 const text=p.haul?String(Math.floor(p.haul.gold+p.haul.resources)):`+${p.strength}`;
                 ctx.strokeText(text,0,-24);ctx.fillText(text,0,-24);
               }else if(sprites[p.team]){
-                const hop=reducedMotion.matches?0:Math.abs(Math.sin(motion*7+p.id*1.7))*8;
-                ctx.save();ctx.translate(0,-18-hop);
+                ctx.save();ctx.translate(0,-18);
                 const face = p.waypoint?.x ?? towerAt(towers,p.to)?.x;
                 if (face !== undefined && face < p.sx) ctx.scale(-1, 1);
-                ctx.rotate(reducedMotion.matches?0:Math.sin(motion*7+p.id*1.7)*.12);
                 ctx.drawImage(sprites[p.team],-19,-24,38,48);ctx.restore();
                 if(p.scoutUntil||p.elite){ctx.fillStyle='#fff1a2';ctx.font='bold 14px Arial';ctx.fillText(p.elite?'★':'◉',-6,-46);}
               }
@@ -240,21 +233,19 @@ export const TroopLayer = memo(function TroopLayer({camera, viewport, speech, pa
               ctx.restore();
             }
             mark.x=f.camera.x; mark.y=f.camera.y; mark.z=zoom; mark.w=f.viewport.w; mark.h=f.viewport.h;
-            mark.gen=f.gen; mark.speech=f.speech; mark.paused=f.paused; mark.hop=(now/16)|0;
+            mark.gen=f.gen; mark.speech=f.speech; mark.paused=f.paused; mark.settled=settled;
           }
         }
-        if(moving||animated)schedule();
+        if(stepping)schedule();
       }
     };
     const schedule=()=>{if(!disposed&&!id)id=requestAnimationFrame(draw);};
     wake.current=schedule;
-    reducedMotion.addEventListener('change',schedule);
     schedule();
     return()=>{
       disposed=true;
       wake.current=()=>{};
       cancelAnimationFrame(id);
-      reducedMotion.removeEventListener('change',schedule);
       source.onload=null;
     };
   },[]);
