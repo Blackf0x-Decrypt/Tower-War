@@ -20,14 +20,26 @@ import {
   withLock,
 } from './room-store';
 import {
+  DECREE_RESPONSE_SECONDS,
   DEVELOPMENT_SECONDS,
   applyDecree,
+  humanTeams,
   initialGame,
+  readySpell,
   recallTroops,
   sendArmy,
+  startSpell,
+  teamIncome,
   teamAlive,
+  TEAM_IDS,
   tick,
 } from './tower-game';
+import {
+  localCustomCandidate,
+  localDecreeCandidates,
+  localCustomDecree,
+  validDecree,
+} from './decrees';
 import { SEAT_AWAY_MS, SEAT_RELEASE_MS } from './room';
 import { battleRenderInput, reactStamp, skipBattleRender } from './live-view';
 import {
@@ -37,6 +49,11 @@ import {
   makeRoomTransport,
   payloadBytes,
 } from './room-protocol';
+import {
+  needsFullBootstrapRetry,
+  roomBootstrapReducer,
+  safeRoomError,
+} from './room-bootstrap';
 import { POST } from '../app/api/room/route';
 
 const REDIS_ENV_NAMES = REDIS_ENV_PAIRS.flat();
@@ -83,6 +100,73 @@ describe('room store', { concurrency: 1 }, () => {
     const again = await roomView(joined.playerId!);
     assert.equal(again.you?.team, 'you');
     assert.equal(again.seats?.[0].name, 'Анна');
+  });
+
+  test('bootstrap state always exits its restoring screen', () => {
+    assert.equal(roomBootstrapReducer('idle', { type: 'start' }), 'loading');
+    assert.equal(
+      roomBootstrapReducer('loading', {
+        type: 'failure',
+        message: 'Комната временно недоступна.',
+      }),
+      'error',
+    );
+    assert.equal(
+      roomBootstrapReducer('loading', { type: 'released' }),
+      'idle',
+    );
+    assert.equal(
+      roomBootstrapReducer('loading', { type: 'complete' }),
+      'idle',
+    );
+  });
+
+  test('bootstrap retries a delta or noop that has no full base', () => {
+    assert.equal(
+      needsFullBootstrapRetry(
+        {
+          transport: 'delta',
+          protocol: 2,
+          revision: 4,
+          base: 'stale-cursor',
+          cursor: 'new-cursor',
+        },
+        null,
+      ),
+      true,
+    );
+    assert.equal(
+      needsFullBootstrapRetry(
+        { transport: 'noop', protocol: 2, revision: 4 },
+        null,
+      ),
+      true,
+    );
+    assert.equal(
+      needsFullBootstrapRetry(
+        { transport: 'full', protocol: 2, revision: 4, cursor: 'cursor', seats: [], started: false, paused: false, startAt: null, you: null, game: null },
+        { revision: 4 },
+      ),
+      false,
+    );
+  });
+
+  test('bootstrap keeps only safe server errors and maps timeouts to retryable state', () => {
+    assert.equal(
+      safeRoomError({ error: 'Комната занята.', code: 'room_busy' }),
+      'Комната занята.',
+    );
+    assert.equal(
+      safeRoomError({ error: 'x'.repeat(181) }),
+      'Комната временно недоступна. Попробуйте ещё раз.',
+    );
+    assert.equal(
+      roomBootstrapReducer('loading', {
+        type: 'failure',
+        message: 'Не удалось связаться с комнатой за 10 секунд.',
+      }),
+      'error',
+    );
   });
 
   test('room transport applies full then compact delta', () => {
@@ -701,24 +785,119 @@ describe('room store', { concurrency: 1 }, () => {
     );
   });
 
-  test('bots do not march or cast during the first four minutes and gold mines do not recruit', () => {
+  test('bots act from match start without a resource or troop advantage', () => {
     let game = initialGame();
     game = {
       ...game,
+      humans: ['you', 'red', 'purple'],
       towers: game.towers.map((tower) =>
         tower.kind === 'gold' ? { ...tower, team: 'you' as const, count: 5 } : tower,
       ),
     };
     const goldBefore = game.towers.find((tower) => tower.kind === 'gold')!.count;
-    for (let i = 0; i < 400; i++) game = tick(game, 0.05);
+    const greenBefore = game.wallets.green.gold;
+    for (let i = 0; i < 240; i++) game = tick(game, 0.05);
     assert.ok(game.age < 240);
-    assert.equal(
-      game.troops.filter((troop) => troop.team !== 'you').length,
-      0,
+    assert.ok(game.troops.some((troop) => troop.team === 'green'));
+    assert.ok(
+      game.wallets.green.gold <= greenBefore,
+      'bot received no direct gold grant',
     );
     assert.equal(game.spell, undefined);
     const gold = game.towers.find((tower) => tower.kind === 'gold' && tower.team === 'you')!;
     assert.equal(gold.count, goldBefore);
+    assert.deepEqual(humanTeams(game), ['you', 'red', 'purple']);
+  });
+
+  test('same mine configuration earns the same gold for every team', () => {
+    const base = initialGame();
+    assert.deepEqual(
+      TEAM_IDS.map((team) => base.wallets[team]),
+      [base.wallets.you, base.wallets.you, base.wallets.you, base.wallets.you],
+    );
+    assert.equal(
+      base.towers.filter((tower) => tower.kind === 'supply').length,
+      4,
+    );
+    const mine = base.towers.find((tower) => tower.kind === 'gold')!;
+    const game = {
+      ...base,
+      towers: base.towers.map((tower) =>
+        tower.id === mine.id
+          ? { ...tower, level: 2, specialty: 'economy' as const, count: 30 }
+          : tower,
+      ),
+    };
+    const incomes = TEAM_IDS.map((team) =>
+      teamIncome(
+        {
+          ...game,
+          towers: game.towers.map((tower) =>
+            tower.id === mine.id ? { ...tower, team } : tower,
+          ),
+        },
+        team,
+      ).gold,
+    );
+    assert.deepEqual(incomes, [incomes[0], incomes[0], incomes[0], incomes[0]]);
+  });
+
+  test('decree choice window, fallback candidates, custom DSL, and leadership guard', () => {
+    const choices = localDecreeCandidates('укрепить рубеж');
+    assert.equal(choices.length, 3);
+    assert.ok(choices.every((choice) => validDecree(choice.patch)));
+    assert.ok(choices.every((choice) => choice.sideEffect.length > 0));
+    assert.ok(validDecree(localCustomDecree('дай штабу 20')!));
+    assert.equal(localCustomDecree('уничтожь красных'), null);
+    assert.ok(localCustomCandidate('дай штабу 20')?.sideEffect.length);
+
+    let game = initialGame();
+    game = {
+      ...game,
+      age: DEVELOPMENT_SECONDS,
+      elapsed: DEVELOPMENT_SECONDS,
+      authority: 'you',
+      authorityEpoch: 4,
+      wallets: {
+        ...game.wallets,
+        you: { ...game.wallets.you, earned: 100 },
+      },
+    };
+    game = startSpell(game, 'you', choices[0].title);
+    assert.ok(game.spell);
+    const expired = tick(
+      { ...game, age: game.age + DECREE_RESPONSE_SECONDS + 0.01 },
+      0.05,
+    );
+    assert.equal(expired.spell, undefined);
+
+    game = startSpell({ ...game, spell: undefined }, 'you', choices[0].title);
+    const armed = readySpell(
+      game,
+      choices[0].patch,
+      4,
+      null,
+      'disabled',
+    );
+    assert.ok(armed.spell?.patch);
+    const hqBefore = armed.towers.find((tower) => tower.home === 'you')!.count;
+    const applied = applyDecree(
+      { ...armed, spell: undefined },
+      'you',
+      choices[0].patch,
+      4,
+    );
+    const hqAfter = applied.towers.find((tower) => tower.home === 'you')!.count;
+    assert.ok(hqAfter > hqBefore);
+    const lostLead = { ...game, authority: 'red' as const, authorityEpoch: 5 };
+    const rejected = readySpell(
+      lostLead,
+      choices[0].patch,
+      4,
+      null,
+      'disabled',
+    );
+    assert.equal(rejected, lostLead);
   });
 });
 
@@ -746,6 +925,23 @@ describe('match end', () => {
     assert.equal(sole.result, 'red');
     assert.equal(teamAlive(sole, 'red'), true);
     assert.equal(teamAlive(sole, 'you'), false);
+
+    const nobody = tick(
+      withAge(
+        {
+          ...opened,
+          towers: opened.towers.map((tower) => ({
+            ...tower,
+            team: null,
+            home: undefined,
+            count: 0,
+          })),
+        },
+        DEVELOPMENT_SECONDS,
+      ),
+      0.05,
+    );
+    assert.equal(nobody.result, 'draw');
 
     const early = tick(
       withAge(
@@ -1001,6 +1197,30 @@ describe('seat release and four players', { concurrency: 1 }, () => {
     assert.notEqual(newbie.playerId, id);
     const left = await roomCommand({ op: 'leave', playerId: newbie.playerId });
     assert.equal(left.seats?.length, 0);
+  });
+
+  test('a stale player id cannot revive itself on reload or join', async () => {
+    const kv = memory();
+    const joined = await roomCommand({ op: 'join', team: 'you', name: 'Анна' });
+    assert.ok(joined.playerId);
+    await ageSeat(kv, joined.playerId!, SEAT_RELEASE_MS + 1);
+
+    const reloaded = await roomView(joined.playerId!);
+    assert.equal(reloaded.you, null);
+    assert.equal(reloaded.seats?.length, 0);
+
+    const secondKv = memory();
+    const second = await roomCommand({ op: 'join', team: 'red', name: 'Борис' });
+    assert.ok(second.playerId);
+    await ageSeat(secondKv, second.playerId!, SEAT_RELEASE_MS + 1);
+    const rejoin = await roomCommand({
+      op: 'join',
+      playerId: second.playerId,
+      team: 'red',
+      name: 'Борис',
+    });
+    assert.match(rejoin.error || '', /освобождено/);
+    assert.equal(rejoin.seats?.length, 0);
   });
 
   test('a started match releases a stale seat and does not let a stranger take it', async () => {

@@ -29,6 +29,14 @@ export type Action = {
   target: Target;
 };
 export type Decree = Action | { kind: 'batch'; actions: Action[] };
+export type DecreeCandidate = {
+  id: string;
+  title: string;
+  flavor: string;
+  description: string;
+  sideEffect: string;
+  patch: Decree;
+};
 function validAction(value: unknown): value is Action {
   if (!value || typeof value !== 'object') return false;
   const p = value as Action;
@@ -181,4 +189,108 @@ export function localDecree(prompt: string): Decree | null {
   else if (/дай|добав|прибав|увелич|\+|подкреп/.test(text) && amount !== null)
     p = { kind: 'reinforce', amount, target };
   return p && validDecree(p) ? p : null;
+}
+
+function actionLabel(action: Action) {
+  if (action.kind === 'reinforce') return `+${action.amount} бойцов штабу`;
+  if (action.kind === 'gold') return `+${action.amount} золота`;
+  if (action.kind === 'resources') return `+${action.amount} древесины`;
+  if (action.kind === 'shield') return `щит штабу на ${action.amount} с`;
+  return 'изменение по указу';
+}
+
+function withSideEffect(main: Action, seed: number): DecreeCandidate {
+  const extras: Action[] = [
+    { kind: 'reinforce', target: 'main', amount: 8 },
+    { kind: 'gold', target: 'all', amount: 12 },
+    { kind: 'resources', target: 'all', amount: 12 },
+    { kind: 'shield', target: 'main', amount: 15 },
+  ];
+  const extra = extras[Math.abs(seed) % extras.length];
+  const patch: Decree = { kind: 'batch', actions: [main, extra] };
+  return {
+    id: `${main.kind}-${seed}`,
+    title: '',
+    flavor: '',
+    description: actionLabel(main),
+    sideEffect: `Случайный довесок уже определён: ${actionLabel(extra)}.`,
+    patch,
+  };
+}
+
+function stableSeed(text: string, salt: number) {
+  let value = 2166136261 ^ salt;
+  for (const char of text) value = Math.imul(value ^ char.charCodeAt(0), 16777619);
+  return value | 0;
+}
+
+/**
+ * The fallback is deliberately modest and targets only the decree author.
+ * It always returns exactly three visible, valid choices, so a provider
+ * outage never blocks the match.
+ */
+export function localDecreeCandidates(prompt: string): DecreeCandidate[] {
+  const seed = stableSeed(prompt, 17);
+  const candidates = [
+    withSideEffect(
+      { kind: 'reinforce', target: 'main', amount: 24 },
+      seed,
+    ),
+    withSideEffect({ kind: 'gold', target: 'all', amount: 36 }, seed + 1),
+    withSideEffect(
+      { kind: 'resources', target: 'all', amount: 36 },
+      seed + 2,
+    ),
+  ];
+  const labels = [
+    ['Срочно увеличить гарнизон штаба', 'Канцелярия нашла ещё один ящик касок.'],
+    ['Золотая лихорадка', 'Казначейство торжественно трясёт копилкой.'],
+    ['Инженерный перекур', 'Инженеры вернулись с досками и непрошеными идеями.'],
+  ];
+  return candidates.map((candidate, index) => ({
+    ...candidate,
+    id: `local-${index}`,
+    title: labels[index][0],
+    flavor: labels[index][1],
+  }));
+}
+
+/**
+ * Custom wording remains constrained to the DSL and to the leader's own
+ * assets. It is intentionally narrower than the legacy free-form parser.
+ */
+export function localCustomDecree(prompt: string): Decree | null {
+  const parsed = localDecree(prompt);
+  if (!parsed || !validDecree(parsed)) return null;
+  const actions = parsed.kind === 'batch' ? parsed.actions : [parsed];
+  if (
+    actions.some(
+      (action) =>
+        !['main', 'all'].includes(String(action.target)) ||
+        !['reinforce', 'gold', 'resources', 'shield'].includes(action.kind) ||
+        action.amount < 0 ||
+        action.amount > 60,
+    )
+  )
+    return null;
+  return parsed;
+}
+
+export function localCustomCandidate(prompt: string): DecreeCandidate | null {
+  const patch = localCustomDecree(prompt);
+  if (!patch) return null;
+  const actions = patch.kind === 'batch' ? patch.actions : [patch];
+  const extra: Action = [
+    { kind: 'reinforce', target: 'main', amount: 6 },
+    { kind: 'gold', target: 'all', amount: 10 },
+    { kind: 'resources', target: 'all', amount: 10 },
+  ][Math.abs(stableSeed(prompt, 91)) % 3];
+  return {
+    id: 'custom',
+    title: 'Ваш приказ',
+    flavor: 'Собственная формулировка лидера.',
+    description: actions.map(actionLabel).join(' · '),
+    sideEffect: `Случайный довесок уже определён: ${actionLabel(extra)}.`,
+    patch: { kind: 'batch', actions: [...actions, extra] },
+  };
 }

@@ -1,5 +1,10 @@
 import { validDebuff, type Debuff } from './magic';
-import { validDecree, type Decree, type Target } from './decrees';
+import {
+  localDecreeCandidates,
+  validDecree,
+  type Decree,
+  type Target,
+} from './decrees';
 export type Team = 'you' | 'red' | 'purple' | 'green';
 export type Kind =
   | 'tower'
@@ -156,6 +161,7 @@ export function playerName(g: Game, team: Team) {
 export const TEAM_IDS = Object.keys(TEAMS) as Team[];
 export const DURATION = 720;
 export const DEVELOPMENT_SECONDS = 240;
+export const DECREE_RESPONSE_SECONDS = 30;
 export const WORLD_WIDTH = 2400;
 export const WORLD_HEIGHT = 1700;
 const MOVE_SPEED = 2.2;
@@ -190,7 +196,7 @@ export function initialGame(): Game {
       ['lumber', 15, 33, 10],
       ['barracks', 30, 32, 18],
       ['tower', 41, 23, 22],
-      [index % 2 ? 'relay' : 'supply', 41, 43, 25],
+      ['supply', 41, 43, 25],
     ];
     buildings.forEach(([kind, x, y, count], j) =>
       towers.push({
@@ -1428,7 +1434,6 @@ export function tick(previous: Game, dt = 0.05): Game {
         (t) => t.team === team && t.level >= 2 && !t.specialty,
       );
       if (branch) g = specialize(g, branch.id, specialties(branch)[0], team);
-      if (g.age < DEVELOPMENT_SECONDS) continue;
       if (
         buildings[0] &&
         g.age > 60 &&
@@ -1486,10 +1491,11 @@ export function tick(previous: Game, dt = 0.05): Game {
     g.age >= g.botDecreeAt &&
     !g.spell
   ) {
-    g = startSpell(g, g.authority, 'Штабу +35 бойцов');
+    const choice = localDecreeCandidates('бот: поддержать оборону')[0];
+    g = startSpell(g, g.authority, choice.title);
     g = readySpell(
       g,
-      { kind: 'reinforce', target: 'main', amount: 35 },
+      choice.patch,
       g.authorityEpoch,
       null,
       'disabled',
@@ -1519,7 +1525,10 @@ export function tick(previous: Game, dt = 0.05): Game {
         ];
         g.notice += ` Побочный эффект: ${spell.debuff.title}.`;
       }
-    } else if (!spell.patch && g.age - spell.startedAt > 25) {
+    } else if (
+      !spell.patch &&
+      g.age - spell.startedAt > DECREE_RESPONSE_SECONDS
+    ) {
       g.spell = undefined;
       g.notice = 'Время ожидания приказа истекло';
     }
@@ -1527,6 +1536,7 @@ export function tick(previous: Game, dt = 0.05): Game {
   if (g.age >= DEVELOPMENT_SECONDS) {
     const alive = TEAM_IDS.filter((team) => teamAlive(g, team));
     if (alive.length === 1) g.result = alive[0];
+    else if (alive.length === 0) g.result = 'draw';
   }
   if (g.elapsed >= DURATION - 1e-4 && !g.result)
     g.result = economicLeader(g) ?? 'draw';

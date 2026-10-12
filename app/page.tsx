@@ -33,8 +33,7 @@ import {
   type Recording,
   type ReplayState,
 } from '@/lib/replays';
-import { validDecree } from '@/lib/decrees';
-import { validDebuff } from '@/lib/magic';
+import { validDecree, type DecreeCandidate } from '@/lib/decrees';
 import { applyPlay, type PlayAction } from '@/lib/play';
 import { publishDrawSample } from '@/lib/draw-sample';
 import { reactStamp, retainBattle } from '@/lib/live-view';
@@ -44,8 +43,15 @@ import {
   type RoomTransport,
 } from '@/lib/room-protocol';
 import {
+  needsFullBootstrapRetry,
+  ROOM_BOOTSTRAP_TIMEOUT_MS,
+  safeRoomError,
+  type RoomBootstrapState,
+} from '@/lib/room-bootstrap';
+import {
   DURATION,
   DEVELOPMENT_SECONDS,
+  DECREE_RESPONSE_SECONDS,
   WORLD_WIDTH,
   WORLD_HEIGHT,
   TEAM_IDS,
@@ -139,7 +145,9 @@ export default function Home() {
   const [typingSeconds, setTypingSeconds] = useState(10);
   const [started, setStarted] = useState(false);
   const [seat, setSeat] = useState<{ id: string; team: Team } | null>(null);
-  const [resuming, setResuming] = useState(false);
+  const [resumeState, setResumeState] = useState<RoomBootstrapState>('idle');
+  const resumeStateRef = useRef<RoomBootstrapState>('idle');
+  const [resumeAttempt, setResumeAttempt] = useState(0);
   const [callName, setCallName] = useState('Игрок');
   const [picked, setPicked] = useState<Team>('you');
   const [roomError, setRoomError] = useState('');
@@ -154,6 +162,10 @@ export default function Home() {
   const [clock, setClock] = useState(0);
   const seatRef = useRef(seat);
   if (seat) seatRef.current = seat;
+  function updateResumeState(next: RoomBootstrapState) {
+    resumeStateRef.current = next;
+    setResumeState(next);
+  }
   const transportRef = useRef<AppliedRoom | null>(null);
   const sharedRef = useRef(false);
   const pushRef = useRef<(next: Game, force?: boolean) => void>(() => {});
@@ -178,6 +190,8 @@ export default function Home() {
     'loading',
   );
   const [promptMessage, setPromptMessage] = useState('');
+  const [candidates, setCandidates] = useState<DecreeCandidate[]>([]);
+  const [showCustom, setShowCustom] = useState(false);
   const pending = useRef<AbortController | null>(null);
   const spellFlight = useRef<{
     abort: AbortController;
@@ -251,14 +265,6 @@ export default function Home() {
     setGame(shown);
   }
   pushRef.current = pushGame;
-  function roomFailure(data: { code?: string; error?: string }) {
-    return (
-      data.code === 'redis_missing' ||
-      data.code === 'redis_error' ||
-      data.code === 'room_error' ||
-      data.code === 'room_busy'
-    );
-  }
   function ingest(message: RoomTransport) {
     const data = applyRoomTransport(transportRef.current, message);
     if (!data) {
@@ -280,7 +286,7 @@ export default function Home() {
     setSeat(next);
     setCallName(saved.name);
     setPicked(saved.team);
-    setResuming(true);
+    updateResumeState('loading');
   }, []);
   useEffect(() => {
     fetch('/api/decree')
@@ -299,88 +305,81 @@ export default function Home() {
     let timer = 0;
     let ticket = 0;
     let misses = 0;
-    const pull = async () => {
-      if (!seatRef.current) {
-        const saved = readSavedSeat();
-        if (saved) seatRef.current = { id: saved.playerId, team: saved.team };
-      }
-      const id = seatRef.current?.id;
-      const mine = ++ticket;
+    const clearReleasedSeat = (data: AppliedRoom) => {
+      writeSavedSeat(null);
+      sharedRef.current = false;
+      seatRef.current = null;
+      transportRef.current = null;
+      setSeat(null);
+      setStarted(false);
+      setLobby(data);
+      setRoomError('Место освобождено: связи не было больше 3 минут.');
+      updateResumeState('idle');
+    };
+    const requestRoom = async (id: string | undefined, full = false) => {
+      const controller = new AbortController();
+      const timeout =
+        resumeStateRef.current === 'loading'
+          ? window.setTimeout(() => controller.abort(), ROOM_BOOTSTRAP_TIMEOUT_MS)
+          : 0;
       try {
-        const cursor = transportRef.current?.cursor;
         const query = new URLSearchParams();
         if (id) query.set('player', id);
-        if (cursor) query.set('cursor', cursor);
+        if (!full && transportRef.current?.cursor)
+          query.set('cursor', transportRef.current.cursor);
         const response = await fetch(
           '/api/room' + (query.size ? `?${query}` : ''),
-          { cache: 'no-store' },
+          { cache: 'no-store', signal: controller.signal },
         );
+        const body = (await response.json()) as RoomTransport & {
+          error?: string;
+          code?: string;
+        };
+        return { response, body };
+      } finally {
+        if (timeout) window.clearTimeout(timeout);
+      }
+    };
+    const pull = async () => {
+      const id = seatRef.current?.id;
+      const mine = ++ticket;
+      const booting = resumeStateRef.current === 'loading';
+      try {
+        let { response, body: message } = await requestRoom(id);
+        if (stop || mine !== ticket) return;
         if (!response.ok) {
-          try {
-            const failed = (await response.json()) as { error?: string; code?: string };
-            if (failed.error) setRoomError(failed.error);
-          } catch {}
+          const error = safeRoomError(message);
+          setRoomError(error);
+          if (booting) updateResumeState('error');
           return;
         }
-        const message = (await response.json()) as RoomTransport;
-        if (stop || mine !== ticket) return;
-        const data = ingestRef.current(message);
+        let data = ingestRef.current(message);
+        if (booting && needsFullBootstrapRetry(message, data)) {
+          transportRef.current = null;
+          ({ response, body: message } = await requestRoom(id, true));
+          if (stop || mine !== ticket) return;
+          if (!response.ok) {
+            const error = safeRoomError(message);
+            setRoomError(error);
+            updateResumeState('error');
+            return;
+          }
+          data = ingestRef.current(message);
+          if (!data) {
+            setRoomError('Не удалось получить полное состояние матча. Попробуйте ещё раз.');
+            updateResumeState('error');
+            return;
+          }
+        }
         if (!data) return;
         setRoomError('');
-        if (message.transport === 'noop') return;
         if (id && seatRef.current?.id === id && !data.you) {
-          if (data.started) {
-            const saved = readSavedSeat();
-            if (saved && misses < 1) {
-              misses += 1;
-              const rejoined = await fetch('/api/room', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  op: 'join',
-                  playerId: saved.playerId,
-                  team: saved.team,
-                  name: saved.name,
-                  cursor: transportRef.current?.cursor,
-                }),
-              });
-              if (rejoined.ok) {
-                const body = (await rejoined.json()) as {
-                  playerId?: string;
-                  error?: string;
-                  transport?: RoomTransport;
-                };
-                if (body.transport) ingestRef.current(body.transport);
-                if (body.playerId === saved.playerId) return;
-                setRoomError(
-                  body.error ||
-                    'Место освобождено: связи не было больше 3 минут.',
-                );
-              }
-            } else {
-              setRoomError('Место освобождено: связи не было больше 3 минут.');
-            }
-            writeSavedSeat(null);
-            sharedRef.current = false;
-            seatRef.current = null;
-            transportRef.current = null;
-            setSeat(null);
-            setResuming(false);
-            setStarted(false);
-            setLobby(data);
+          if (booting || data.started) {
+            clearReleasedSeat(data);
             return;
           }
           misses += 1;
-          if (misses < 3) return;
-          setRoomError('Место освобождено: связи не было больше 3 минут.');
-          writeSavedSeat(null);
-          sharedRef.current = false;
-          seatRef.current = null;
-          transportRef.current = null;
-          setSeat(null);
-          setResuming(false);
-          setStarted(false);
-          setLobby(data);
+          if (misses >= 3) clearReleasedSeat(data);
           return;
         }
         misses = 0;
@@ -403,17 +402,23 @@ export default function Home() {
             roomPausedRef.current = data.paused;
             setPaused(data.paused);
           }
-          setResuming(false);
+          updateResumeState('idle');
         } else if (sharedRef.current && !data.started) {
           sharedRef.current = false;
           initialized.current = false;
           setStarted(false);
           pushRef.current(initialGame(), true);
-          setResuming(false);
+          updateResumeState('idle');
         } else if (data.you) {
-          setResuming(false);
+          updateResumeState('idle');
         }
-      } catch {}
+      } catch {
+        if (stop || mine !== ticket) return;
+        if (booting) {
+          setRoomError('Не удалось связаться с комнатой за 10 секунд. Проверьте сеть и повторите.');
+          updateResumeState('error');
+        }
+      }
     };
     const arm = () => {
       window.clearTimeout(timer);
@@ -445,7 +450,7 @@ export default function Home() {
       window.removeEventListener('focus', onWake);
       window.removeEventListener('pageshow', onWake);
     };
-  }, [seat]);
+  }, [seat, resumeAttempt]);
   useEffect(() => {
     if (!lobby?.startAt || started) return;
     const timer = window.setInterval(() => setClock(Date.now()), 200);
@@ -483,6 +488,7 @@ export default function Home() {
     })();
   }, [game.authority, game.result, paused, help, started]);
   const messageMode = !recording && messageOpportunity(game, meRef.current);
+  const developing = game.age < DEVELOPMENT_SECONDS;
   useEffect(() => {
     if (!messageMode) setMessageDraft('');
   }, [messageMode]);
@@ -494,7 +500,9 @@ export default function Home() {
       if (left === 0) {
         setTypingDeadline(0);
         setDraft('');
-        setPromptMessage('Время вышло! Наберите новый приказ за 10 секунд.');
+        setCandidates([]);
+        setShowCustom(false);
+        setPromptMessage('30 секунд на указ истекли. Право ждёт следующего лидера.');
       }
     };
     update();
@@ -504,10 +512,24 @@ export default function Home() {
   useEffect(() => {
     if (!started || game.result || game.authority !== meRef.current) {
       setTypingDeadline(0);
-      setTypingSeconds(10);
+      setTypingSeconds(DECREE_RESPONSE_SECONDS);
       setDraft('');
+      setCandidates([]);
+      setShowCustom(false);
     }
   }, [game.authority, game.result, started, seat?.team]);
+  useEffect(() => {
+    if (
+      started &&
+      !game.result &&
+      !developing &&
+      game.authority === meRef.current &&
+      !typingDeadline
+    ) {
+      setTypingDeadline(Date.now() + DECREE_RESPONSE_SECONDS * 1000);
+      setTypingSeconds(DECREE_RESPONSE_SECONDS);
+    }
+  }, [started, game.result, game.authority, developing, typingDeadline]);
   const blockPaste = (e: React.SyntheticEvent) => {
     e.preventDefault();
     setPromptMessage('Приказ нужно набрать вручную. Вставка отключена.');
@@ -628,7 +650,8 @@ export default function Home() {
   const me: Team = seat?.team ?? 'you';
   meRef.current = me;
   const source = game.towers.find((t) => t.id === selected && t.team === me);
-  const developing = game.age < DEVELOPMENT_SECONDS;
+  const canIssueDecree =
+    !roomError && !developing && game.authority === me;
   const developmentLeft = Math.max(
     0,
     Math.ceil(DEVELOPMENT_SECONDS - game.age),
@@ -718,7 +741,7 @@ export default function Home() {
       seatRef.current = null;
       transportRef.current = null;
       setSeat(null);
-      setResuming(false);
+      updateResumeState('idle');
     }
     sharedRef.current = false;
     setBusy(false);
@@ -743,15 +766,7 @@ export default function Home() {
     focusPoint(18, 20, viewportRef.current.w < 600 ? 0.65 : 0.8);
   };
   async function roomPost(body: Record<string, unknown>) {
-    const response = await fetch('/api/room', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        ...body,
-        cursor: transportRef.current?.cursor,
-      }),
-    });
-    const data = (await response.json()) as {
+    type RoomPostResponse = {
       error?: string;
       code?: string;
       playerId?: string;
@@ -765,22 +780,46 @@ export default function Home() {
       spellEpoch?: number | null;
       transport?: RoomTransport;
     };
-    if (!response.ok) {
-      if (data.error) setRoomError(data.error);
+    const controller = new AbortController();
+    const timeout = window.setTimeout(
+      () => controller.abort(),
+      ROOM_BOOTSTRAP_TIMEOUT_MS,
+    );
+    try {
+      const response = await fetch('/api/room', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...body,
+          cursor: transportRef.current?.cursor,
+        }),
+        signal: controller.signal,
+      });
+      const data = (await response.json()) as RoomPostResponse;
+      if (!response.ok) {
+        const error = safeRoomError(data);
+        setRoomError(error);
+        return { ...data, error };
+      }
+      if (data.transport) {
+        const applied = ingest(data.transport);
+        if (applied && roomPausedRef.current !== applied.paused) {
+          roomPausedRef.current = applied.paused;
+          setPaused(applied.paused);
+        }
+        if (applied?.game && (applied.started || data.started)) {
+          sharedRef.current = true;
+          if (!startedRef.current) setStarted(true);
+        }
+      }
       return data;
+    } catch {
+      const error = 'Комната временно недоступна. Попробуйте ещё раз.';
+      setRoomError(error);
+      return { error, code: 'room_error' };
+    } finally {
+      window.clearTimeout(timeout);
     }
-    if (data.transport) {
-      const applied = ingest(data.transport);
-      if (applied && roomPausedRef.current !== applied.paused) {
-        roomPausedRef.current = applied.paused;
-        setPaused(applied.paused);
-      }
-      if (applied?.game && (applied.started || data.started)) {
-        sharedRef.current = true;
-        if (!startedRef.current) setStarted(true);
-      }
-    }
-    return data;
   }
   async function sit(team: Team) {
     setRoomError('');
@@ -801,7 +840,7 @@ export default function Home() {
     meRef.current = data.team;
     setSeat(next);
     setPicked(data.team);
-    setResuming(false);
+    updateResumeState('idle');
     writeSavedSeat({ playerId: data.playerId, team: data.team, name });
   }
   async function releaseSeat() {
@@ -817,7 +856,7 @@ export default function Home() {
     transportRef.current = null;
     sharedRef.current = false;
     setSeat(null);
-    setResuming(false);
+    updateResumeState('idle');
     setStarted(false);
     setPaused(false);
     pushGame(initialGame(), true);
@@ -926,48 +965,22 @@ export default function Home() {
       !draft.trim()
     )
       return;
-    const submittedDraft = draft;
-    setTypingDeadline(0);
-    setDraft('');
+    const submittedDraft = draft.trim();
     const request = new AbortController();
     pending.current = request;
-    const start = play({
-      type: 'spell-start',
-      text: submittedDraft,
-      roll: debuffsEnabled ? 'rolling' : 'disabled',
-    });
-    spellFlight.current = { abort: request, start };
     setBusy(true);
-    let applied = false;
-    let nonce: number | null = null;
-    let epoch = current.authorityEpoch;
     setPromptMessage('');
     try {
-      const startedSpell = await start;
-      nonce = startedSpell?.nonce ?? null;
-      if (typeof startedSpell?.epoch === 'number') epoch = startedSpell.epoch;
-      if (request.signal.aborted) return;
-      if (nonce == null) {
-        if (roomFailure({ code: startedSpell?.code, error: startedSpell?.error }))
-          setRoomError(startedSpell?.error || 'Комната временно недоступна.');
-        else
-          setPromptMessage(
-            startedSpell?.error || 'Приказ не начат. Лидерство уже у другого.',
-          );
-        return;
-      }
       const response = await fetch('/api/decree', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: submittedDraft, debuffsEnabled }),
+        body: JSON.stringify({ prompt: submittedDraft }),
         signal: request.signal,
       });
       const data = (await response.json()) as {
         error?: string;
-        patch?: unknown;
-        debuff?: unknown;
-        roll?: string;
         provider?: string;
+        candidates?: unknown;
       };
       if (pending.current !== request || request.signal.aborted) return;
       if (!response.ok) {
@@ -975,45 +988,104 @@ export default function Home() {
         return;
       }
       if (data.provider === 'deepseek') setProvider('deepseek');
-      const patch = data.patch;
-      if (
-        !validDecree(patch) ||
-        (data.roll === 'debuff' && !validDebuff(data.debuff))
-      ) {
-        setPromptMessage('Не удалось понять приказ. Уточните формулировку.');
+      const available = Array.isArray(data.candidates)
+        ? data.candidates.filter(
+            (candidate): candidate is DecreeCandidate =>
+              !!candidate &&
+              typeof candidate === 'object' &&
+              typeof candidate.title === 'string' &&
+              typeof candidate.flavor === 'string' &&
+              typeof candidate.description === 'string' &&
+              typeof candidate.sideEffect === 'string' &&
+              validDecree((candidate as DecreeCandidate).patch),
+          )
+        : [];
+      if (available.length !== 3) {
+        setPromptMessage('Не удалось подготовить три безопасных варианта.');
         return;
       }
-      if (!activeRef.current) {
-        setPromptMessage('Бой приостановлен. Приказ отменён.');
-        return;
-      }
-      await play({
-        type: 'spell-ready',
-        patch,
-        epoch,
-        debuff: validDebuff(data.debuff) ? data.debuff : null,
-        roll: data.roll ?? 'disabled',
-      });
-      applied = true;
-      if (
-        gameRef.current.authority === me &&
-        gameRef.current.authorityEpoch === epoch
-      ) {
-        setDraft('');
-        setPromptMessage('Удержите лидерство до исполнения!');
-      } else setPromptMessage('Вы потеряли лидерство. Приказ не применён.');
+      setCandidates(available);
+      setShowCustom(false);
+      setPromptMessage('Выберите один из трёх указов или напишите свой.');
     } catch {
       if (!request.signal.aborted)
         setPromptMessage('Не удалось отправить приказ. Попробуйте снова.');
     } finally {
-      const ownFlight = spellFlight.current?.abort === request;
-      if (ownFlight) spellFlight.current = null;
       if (pending.current === request) {
         pending.current = null;
         setBusy(false);
       }
-      if (!applied && nonce != null && !request.signal.aborted && ownFlight)
-        await play({ type: 'spell-cancel', nonce });
+    }
+  }
+  async function selectCandidate(candidate: DecreeCandidate) {
+    const current = gameRef.current;
+    if (
+      !typingDeadline ||
+      Date.now() >= typingDeadline ||
+      current.authority !== me ||
+      current.result ||
+      current.spell ||
+      !validDecree(candidate.patch)
+    )
+      return;
+    setBusy(true);
+    const start = play({
+      type: 'spell-start',
+      text: candidate.title,
+      roll: 'disabled',
+    });
+    spellFlight.current = { abort: new AbortController(), start };
+    try {
+      const begun = await start;
+      if (begun.nonce == null || typeof begun.epoch !== 'number') {
+        setPromptMessage(begun.error || 'Лидерство уже у другого.');
+        return;
+      }
+      await play({
+        type: 'spell-ready',
+        patch: candidate.patch,
+        epoch: begun.epoch,
+        debuff: null,
+        roll: 'disabled',
+      });
+      setTypingDeadline(0);
+      setCandidates([]);
+      setDraft('');
+      setPromptMessage('Указ объявлен. Удержите лидерство до исполнения.');
+    } finally {
+      spellFlight.current = null;
+      setBusy(false);
+    }
+  }
+  async function submitCustom(e: React.FormEvent) {
+    e.preventDefault();
+    if (!draft.trim() || !typingDeadline || Date.now() >= typingDeadline) return;
+    setBusy(true);
+    try {
+      const response = await fetch('/api/decree', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: draft.trim(), custom: true }),
+      });
+      const data = (await response.json()) as {
+        error?: string;
+        custom?: unknown;
+      };
+      const custom = data.custom as DecreeCandidate | undefined;
+      if (
+        !response.ok ||
+        !custom ||
+        typeof custom.title !== 'string' ||
+        !validDecree(custom.patch)
+      ) {
+        setPromptMessage(data.error || 'Своя формулировка не подходит правилам указа.');
+        return;
+      }
+      await selectCandidate(custom);
+    } catch {
+      setPromptMessage('Не удалось проверить свою формулировку.');
+    } finally {
+      setBusy(false);
     }
   }
   async function submitMessage(e: React.FormEvent) {
@@ -1025,15 +1097,43 @@ export default function Home() {
     setMessageDraft('');
     setPromptMessage('Сообщение над штабом · 10 секунд');
   }
-  if (!started && resuming)
+  const retryRestore = () => {
+    setRoomError('');
+    updateResumeState('loading');
+    setResumeAttempt((attempt) => attempt + 1);
+  };
+  const returnToLobby = () => {
+    writeSavedSeat(null);
+    seatRef.current = null;
+    transportRef.current = null;
+    sharedRef.current = false;
+    setSeat(null);
+    setStarted(false);
+    updateResumeState('idle');
+  };
+  if (!started && resumeState !== 'idle')
     return (
       <main className="start-screen">
         <div className="start-cloud">
           <span>СТРАТЕГИЯ, В КОТОРОЙ ВЛАСТЬ МЕНЯЕТ ПРАВИЛА</span>
         </div>
         <section className="start-panel">
-          <p>Возвращаем вас в матч…</p>
+          <p>
+            {resumeState === 'loading'
+              ? 'Возвращаем вас в матч…'
+              : 'Не удалось вернуться в матч.'}
+          </p>
           {roomError && <p className="room-error">{roomError}</p>}
+          {resumeState === 'error' && (
+            <div className="resume-actions">
+              <button className="primary" onClick={retryRestore}>
+                Повторить
+              </button>
+              <button className="resume-lobby" onClick={returnToLobby}>
+                В лобби
+              </button>
+            </div>
+          )}
         </section>
       </main>
     );
@@ -1260,6 +1360,11 @@ export default function Home() {
                   op: 'pause',
                   playerId: seatRef.current.id,
                   paused: next,
+                }).then((data) => {
+                  if (data.error) {
+                    roomPausedRef.current = !next;
+                    setPaused(!next);
+                  }
                 });
                 return;
               }
@@ -2140,19 +2245,19 @@ export default function Home() {
       )}
       {!recording && (
         <section
-          className={`wish-panel ${game.authority === me || messageMode ? 'granted' : 'locked'}`}
+          className={`wish-panel ${canIssueDecree || messageMode ? 'granted' : 'locked'}`}
         >
           <div className="wish-heading">
             <span className="wish-medal">
-              {game.authority === me || messageMode ? <Sparkles /> : <LockKeyhole />}
+              {canIssueDecree || messageMode ? <Sparkles /> : <LockKeyhole />}
             </span>
             <div>
               <span className="eyebrow">ПРАВО ЛИДЕРА</span>
               <h2>
                 {game.result
                   ? 'Битва завершена'
-                  : !developing && game.authority === me
-                    ? 'Ваш приказ · 10 секунд'
+                  : canIssueDecree
+                    ? 'Ваш приказ · 30 секунд'
                     : messageMode
                       ? 'Сообщение над штабом'
                       : developing
@@ -2163,20 +2268,21 @@ export default function Home() {
               </h2>
             </div>
             <span className="wish-status">
-              {game.authority === me
+              {canIssueDecree
                 ? '👑 ВАША ВЛАСТЬ'
                 : messageMode
                   ? 'РЕПЛИКА'
                   : `${Math.floor(money.earned)} ОЧКОВ ЭКОНОМИКИ`}
             </span>
           </div>
-          {(messageMode || (!developing && game.authority === me)) &&
+          {(messageMode || canIssueDecree) &&
           !game.result ? (
             <>
-            {!developing && game.authority === me && (
+            {canIssueDecree && (
             <form onSubmit={submitPrompt}>
               <label htmlFor="wish">
-                Меняй армии и правила. Нельзя только объявить «я победил».
+                Опишите тему указа — появятся три точных варианта с заранее
+                показанным дополнительным эффектом.
               </label>
               <div className="wish-input">
                 <textarea
@@ -2205,11 +2311,6 @@ export default function Home() {
                       blockPaste(e);
                   }}
                   onChange={(e) => {
-                    if (!typingDeadline) {
-                      setTypingDeadline(Date.now() + 10000);
-                      setTypingSeconds(10);
-                      setPromptMessage('');
-                    }
                     setDraft(e.target.value);
                   }}
                   maxLength={350}
@@ -2231,10 +2332,10 @@ export default function Home() {
                   {busy
                     ? 'Бой продолжается. Удерживайте лидерство…'
                     : provider === 'deepseek'
-                      ? 'Желание понимает DeepSeek'
+                      ? 'DeepSeek предлагает варианты в рамках правил'
                       : provider === 'loading'
                         ? 'Проверяем связь…'
-                        : 'Простые приказы · DeepSeek ещё не подключён'}
+                        : 'Локальные варианты готовы даже без DeepSeek'}
                 </span>
                 <span
                   className={`typing-clock ${typingSeconds <= 3 ? 'urgent' : ''}`}
@@ -2243,10 +2344,35 @@ export default function Home() {
                     ? 'Приказ отправлен'
                     : typingDeadline
                       ? `${typingSeconds.toFixed(1)} с`
-                      : '10 с на ввод · без вставки'}{' '}
+                      : '30 с на выбор · без вставки'}{' '}
                   · {draft.length}/350
                 </span>
               </div>
+              {candidates.length === 3 && (
+                <div className="decree-candidates">
+                  {candidates.map((candidate) => (
+                    <button
+                      key={candidate.id}
+                      type="button"
+                      disabled={busy || !!game.spell}
+                      onClick={() => void selectCandidate(candidate)}
+                    >
+                      <b>{candidate.title}</b>
+                      <small>{candidate.flavor}</small>
+                      <span>{candidate.description}</span>
+                      <em>{candidate.sideEffect}</em>
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() => setShowCustom(true)}
+                    disabled={busy || !!game.spell}
+                  >
+                    <b>Своя формулировка</b>
+                    <small>Только ваш штаб и ваша команда.</small>
+                  </button>
+                </div>
+              )}
               <div className="wish-examples">
                 <span>Попробуй:</span>
                 {[
@@ -2258,6 +2384,25 @@ export default function Home() {
                 ))}
               </div>
             </form>
+            )}
+            {canIssueDecree && showCustom && (
+              <form onSubmit={submitCustom} className="custom-decree">
+                <label htmlFor="custom-wish">
+                  Свой указ: подкрепление, золото, древесина или щит для вашей команды.
+                </label>
+                <div className="wish-input">
+                  <textarea
+                    id="custom-wish"
+                    value={draft}
+                    onChange={(e) => setDraft(e.target.value)}
+                    maxLength={350}
+                    rows={2}
+                  />
+                  <button type="submit" disabled={busy || !draft.trim()}>
+                    Проверить и исполнить
+                  </button>
+                </div>
+              </form>
             )}
             {messageMode && (
               <form onSubmit={submitMessage}>

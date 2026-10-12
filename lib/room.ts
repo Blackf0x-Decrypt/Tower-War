@@ -195,11 +195,19 @@ function dropStale(current: Room, now: number) {
   for (const seat of gone) releaseSeat(current, seat, now);
 }
 
-export function prepare(current: Room, playerId: string | null | undefined, now: number) {
-  noteSeen(current, playerId, now);
+export function prepare(
+  current: Room,
+  playerId: string | null | undefined,
+  now: number,
+) {
   advance(current, now);
+  const released = !!playerId && current.seats.some(
+    (seat) => seat.id === playerId && now - seat.seen > SEAT_RELEASE_MS,
+  );
   dropStale(current, now);
+  noteSeen(current, playerId, now);
   launch(current, now);
+  return released;
 }
 
 function viewOf(current: Room, playerId: string | null, now = Date.now()): RoomView {
@@ -312,9 +320,14 @@ export async function roomCommand(body: {
   const kv = resolveKv();
   if (kv === 'missing') return missingRoom();
   return editRoom((current, now) => {
-    prepare(current, body.playerId, now);
+    const released = prepare(current, body.playerId, now);
     const op = body.op;
     if (op === 'join') {
+      if (body.playerId && released)
+        return {
+          ...viewOf(current, null, now),
+          error: 'Место освобождено: связи не было больше 3 минут.',
+        };
       if (body.playerId) {
         const existing = current.seats.find((s) => s.id === body.playerId);
         if (existing) {
