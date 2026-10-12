@@ -62,6 +62,19 @@ import {
   safeRoomError,
 } from './room-bootstrap';
 import { POST } from '../app/api/room/route';
+import {
+  assertSymmetricStartWallets,
+  chaosMineBirthEligible,
+  garrisonRecruitAllowed,
+} from './economy-rules';
+import {
+  isRoomBusy,
+  roomBusyBackoffMs,
+  ROOM_BUSY_MAX_RETRIES,
+} from './room-client';
+import { registryCoversAllKinds } from './chaos-registry';
+import { pickTroopRole, roleMult } from './troop-rules';
+import { production } from './tower-game';
 
 const REDIS_ENV_NAMES = REDIS_ENV_PAIRS.flat();
 
@@ -1594,6 +1607,87 @@ describe('epoch politics and lobby bans', () => {
     assert.equal(veto.spellVetoDelay, 10);
     assert.equal(veto.teamVetoUsed?.red, true);
     assert.equal(decreeVeto(veto, 'red', 'delay'), veto);
+  });
+
+  test('room_busy backoff grows with a cap and stops after max retries', () => {
+    assert.equal(isRoomBusy({ status: 503 }, { code: 'room_busy' }), true);
+    assert.equal(isRoomBusy({ status: 503 }, { code: 'redis_missing' }), false);
+    const a = roomBusyBackoffMs(0);
+    const b = roomBusyBackoffMs(3);
+    assert.ok(b >= a);
+    assert.ok(roomBusyBackoffMs(ROOM_BUSY_MAX_RETRIES) <= 8000);
+  });
+
+  test('chaos registry covers every chaos kind', () => {
+    assert.equal(registryCoversAllKinds(), true);
+  });
+
+  test('resource mines never auto-recruit garrison', () => {
+    const g = initialGame();
+    assert.equal(assertSymmetricStartWallets(g.wallets), true);
+    for (const t of g.towers) {
+      if (t.kind === 'gold' || t.kind === 'lumber') {
+        assert.equal(production({ ...t, team: 'you' }), 0);
+        assert.equal(garrisonRecruitAllowed({ ...t, team: 'you' }), false);
+        assert.equal(chaosMineBirthEligible({ ...t, team: 'you' }), false);
+      }
+    }
+  });
+
+  test('chaos mine birth adds count to barracks not gold mines', () => {
+    let g = initialGame();
+    g.humans = ['you'];
+    g.age = DEVELOPMENT_SECONDS;
+    g.elapsed = DEVELOPMENT_SECONDS;
+    g.wallets.you.earned = 400;
+    g = refreshAuthority(g);
+    assert.equal(g.authority, 'you');
+    const epoch = g.authorityEpoch;
+    const mine = g.towers.find((t) => t.kind === 'gold')!;
+    mine.team = 'you';
+    const barracks = g.towers.find(
+      (t) => t.kind === 'barracks' && Math.hypot(t.x - 18, t.y - 20) < 40,
+    )!;
+    barracks.team = 'you';
+    const mineBefore = mine.count;
+    const barracksBefore = barracks.count;
+    g = applyDecree(
+      g,
+      'you',
+      {
+        kind: 'batch',
+        actions: [
+          { kind: 'chaos_mine_birth', target: 'all', amount: 0, param: 24 },
+        ],
+      },
+      epoch,
+      'test',
+    );
+    assert.equal(
+      g.towers.find((t) => t.id === mine.id)!.count,
+      mineBefore,
+    );
+    assert.ok(
+      g.towers.find((t) => t.id === barracks.id)!.count > barracksBefore,
+    );
+  });
+
+  test('heavy role captures neutrals faster than line at equal dispatch', () => {
+    const linePower =
+      Math.floor(10 * roleMult('line', 'strength')) * roleMult('line', 'capture');
+    const heavyPower =
+      Math.floor(10 * roleMult('heavy', 'strength')) *
+      roleMult('heavy', 'capture');
+    assert.ok(heavyPower > linePower);
+    const role = pickTroopRole({
+      team: 'you',
+      from: 0,
+      to: 1,
+      index: 0,
+      sourceKind: 'barracks',
+      target: { kind: 'tower', team: null, level: 1 },
+    });
+    assert.ok(['line', 'heavy', 'scout', 'skirm'].includes(role));
   });
 
   test('match bootstrap sets mutation and objective', async () => {

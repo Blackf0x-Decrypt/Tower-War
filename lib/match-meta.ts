@@ -4,8 +4,6 @@ import type { Decree } from './decrees';
 import { isChaosKind } from './chaos-rules';
 import { TEAM_IDS, type Game, type Kind, type Team } from './tower-game';
 
-export type TroopVariant = 'line' | 'heavy' | 'scout' | 'skirm';
-
 export type EpochObjectiveKind = 'hold_mines' | 'clear_neutrals' | 'survive_hq';
 
 export type EpochObjective = {
@@ -145,7 +143,7 @@ function addNeutralTower(g: Game, x: number, y: number, kind: Kind, count: numbe
   };
 }
 
-export function applyMapMutation(g: Game, seed: number): MapMutation {
+export function applyMapMutation(g: Game, seed: number): MapMutation | null {
   const roll = seed % 3;
   if (roll === 0) {
     return addNeutralTower(g, 50, 50, 'tower', 28);
@@ -165,48 +163,39 @@ export function applyMapMutation(g: Game, seed: number): MapMutation {
   return bridge;
 }
 
-export function troopVariantFor(
-  team: Team,
-  from: number,
-  to: number,
-  index: number,
-  sourceKind?: Kind,
-): TroopVariant {
-  const h = stableRoomSeed([team, String(from), String(to), String(index), sourceKind ?? '']);
-  const roll = h % 100;
-  if (sourceKind === 'barracks') return roll < 40 ? 'heavy' : roll < 70 ? 'line' : 'skirm';
-  if (roll < 22) return 'scout';
-  if (roll < 48) return 'heavy';
-  if (roll < 74) return 'skirm';
-  return 'line';
-}
-
-export function variantSpeedMult(v: TroopVariant | undefined): number {
-  if (v === 'scout') return 1.12;
-  if (v === 'heavy') return 0.88;
-  return 1;
-}
+export {
+  pickTroopRole,
+  roleMult,
+  troopVariantForDispatch as troopVariantFor,
+  variantSpeedMult,
+  type TroopRole as TroopVariant,
+} from './troop-rules';
 
 export function bootstrapMatch(
   g: Game,
   seed: number,
   banned: Set<ChaosEffectKind>,
   mutator: MatchMutator,
+  fairMode = false,
 ): Game {
-  const mutation = applyMapMutation({ ...g, towers: g.towers.map((t) => ({ ...t })) }, seed);
+  const mutation = fairMode
+    ? null
+    : applyMapMutation({ ...g, towers: g.towers.map((t) => ({ ...t })) }, seed);
+  const mutationNote = mutation ? ` ${mutation.label}.` : '';
   return {
     ...g,
     roomSeed: seed,
+    fairMode,
     bannedChaos: [...banned],
     matchMutator: mutator,
-    mapMutation: mutation,
+    mapMutation: mutation ?? undefined,
     epochObjective: pickEpochObjective(seed >>> 0),
     decreeChronicle: [],
     teamVetoUsed: {},
     speed: Object.fromEntries(
       TEAM_IDS.map((t) => [t, (g.speed[t] ?? 1) * mutator.marchMult]),
     ) as Game['speed'],
-    notice: `${g.notice} ${mutator.label}. ${mutation.label}.`,
+    notice: `${g.notice} ${mutator.label}.${mutationNote}`,
   };
 }
 

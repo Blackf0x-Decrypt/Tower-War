@@ -49,12 +49,10 @@ import {
   type AppliedRoom,
   type RoomTransport,
 } from '@/lib/room-protocol';
-import {
-  needsFullBootstrapRetry,
-  ROOM_BOOTSTRAP_TIMEOUT_MS,
-  safeRoomError,
-  type RoomBootstrapState,
-} from '@/lib/room-bootstrap';
+import { type RoomBootstrapState } from '@/lib/room-bootstrap';
+import { useRoomTransport } from '@/hooks/useRoomTransport';
+import { LobbyPanel } from '@/components/lobby/LobbyPanel';
+import { MatchHud } from '@/components/match/MatchHud';
 import {
   DURATION,
   DEVELOPMENT_SECONDS,
@@ -312,157 +310,27 @@ export default function Home() {
       replayLoad.current?.abort();
     };
   }, []);
-  useEffect(() => {
-    let stop = false;
-    let timer = 0;
-    let ticket = 0;
-    let misses = 0;
-    const clearReleasedSeat = (data: AppliedRoom) => {
-      writeSavedSeat(null);
-      sharedRef.current = false;
-      seatRef.current = null;
-      transportRef.current = null;
-      setSeat(null);
-      setStarted(false);
-      setLobby(data);
-      setRoomError('Место освобождено: связи не было больше 3 минут.');
-      updateResumeState('idle');
-    };
-    const requestRoom = async (id: string | undefined, full = false) => {
-      const controller = new AbortController();
-      const timeout =
-        resumeStateRef.current === 'loading'
-          ? window.setTimeout(() => controller.abort(), ROOM_BOOTSTRAP_TIMEOUT_MS)
-          : 0;
-      try {
-        const query = new URLSearchParams();
-        if (id) query.set('player', id);
-        if (!full && transportRef.current?.cursor)
-          query.set('cursor', transportRef.current.cursor);
-        const response = await fetch(
-          '/api/room' + (query.size ? `?${query}` : ''),
-          { cache: 'no-store', signal: controller.signal },
-        );
-        const body = (await response.json()) as RoomTransport & {
-          error?: string;
-          code?: string;
-        };
-        return { response, body };
-      } finally {
-        if (timeout) window.clearTimeout(timeout);
-      }
-    };
-    const pull = async () => {
-      const id = seatRef.current?.id;
-      const mine = ++ticket;
-      const booting = resumeStateRef.current === 'loading';
-      try {
-        let { response, body: message } = await requestRoom(id);
-        if (stop || mine !== ticket) return;
-        if (!response.ok) {
-          const error = safeRoomError(message);
-          setRoomError(error);
-          if (booting) updateResumeState('error');
-          return;
-        }
-        let data = ingestRef.current(message);
-        if (booting && needsFullBootstrapRetry(message, data)) {
-          transportRef.current = null;
-          ({ response, body: message } = await requestRoom(id, true));
-          if (stop || mine !== ticket) return;
-          if (!response.ok) {
-            const error = safeRoomError(message);
-            setRoomError(error);
-            updateResumeState('error');
-            return;
-          }
-          data = ingestRef.current(message);
-          if (!data) {
-            setRoomError('Не удалось получить полное состояние матча. Попробуйте ещё раз.');
-            updateResumeState('error');
-            return;
-          }
-        }
-        if (!data) return;
-        setRoomError('');
-        if (id && seatRef.current?.id === id && !data.you) {
-          if (booting || data.started) {
-            clearReleasedSeat(data);
-            return;
-          }
-          misses += 1;
-          if (misses >= 3) clearReleasedSeat(data);
-          return;
-        }
-        misses = 0;
-        const lobbyKey = JSON.stringify({
-          seats: data.seats,
-          started: data.started,
-          paused: data.paused,
-          startAt: data.startAt,
-          you: data.you,
-        });
-        if (lobbyKey !== lobbyKeyRef.current) {
-          lobbyKeyRef.current = lobbyKey;
-          setLobby(data);
-        }
-        if (seatRef.current && data.started && data.game) {
-          if (!sharedRef.current) initialized.current = false;
-          sharedRef.current = true;
-          if (!startedRef.current) setStarted(true);
-          if (roomPausedRef.current !== data.paused) {
-            roomPausedRef.current = data.paused;
-            setPaused(data.paused);
-          }
-          updateResumeState('idle');
-        } else if (sharedRef.current && !data.started) {
-          sharedRef.current = false;
-          initialized.current = false;
-          setStarted(false);
-          pushRef.current(initialGame(), true);
-          updateResumeState('idle');
-        } else if (data.you) {
-          updateResumeState('idle');
-        }
-      } catch {
-        if (stop || mine !== ticket) return;
-        if (booting) {
-          setRoomError('Не удалось связаться с комнатой за 10 секунд. Проверьте сеть и повторите.');
-          updateResumeState('error');
-        }
-      }
-    };
-    const arm = () => {
-      window.clearTimeout(timer);
-      const delay = document.hidden
-        ? 8000
-        : !seatRef.current
-          ? 1000
-          : sharedRef.current
-            ? 80
-            : 400;
-      timer = window.setTimeout(() => {
-        void pull().finally(() => {
-          if (!stop) arm();
-        });
-      }, delay);
-    };
-    const onWake = () => {
-      void pull();
-    };
-    document.addEventListener('visibilitychange', onWake);
-    window.addEventListener('focus', onWake);
-    window.addEventListener('pageshow', onWake);
-    void pull();
-    arm();
-    return () => {
-      stop = true;
-      window.clearTimeout(timer);
-      document.removeEventListener('visibilitychange', onWake);
-      window.removeEventListener('focus', onWake);
-      window.removeEventListener('pageshow', onWake);
-    };
-  }, [seat, resumeAttempt]);
+  const { roomPost } = useRoomTransport({
+    seat,
+    resumeAttempt,
+    resumeStateRef,
+    transportRef,
+    seatRef,
+    sharedRef,
+    startedRef,
+    roomPausedRef,
+    initialized,
+    ingestRef,
+    pushRef,
+    lobbyKeyRef,
+    setLobby,
+    setRoomError,
+    setSeat,
+    setStarted,
+    setPaused,
+    updateResumeState,
+    writeSavedSeat,
+  });
   useEffect(() => {
     if (!lobby?.startAt || started) return;
     const timer = window.setInterval(() => setClock(Date.now()), 200);
@@ -936,62 +804,6 @@ export default function Home() {
     setStarted(true);
     focusPoint(18, 20, viewportRef.current.w < 600 ? 0.65 : 0.8);
   };
-  async function roomPost(body: Record<string, unknown>) {
-    type RoomPostResponse = {
-      error?: string;
-      code?: string;
-      playerId?: string;
-      team?: Team;
-      started?: boolean;
-      paused?: boolean;
-      seats?: { name: string; team: Team; ready: boolean }[];
-      you?: { team: Team; ready: boolean } | null;
-      startAt?: number | null;
-      spellNonce?: number | null;
-      spellEpoch?: number | null;
-      transport?: RoomTransport;
-    };
-    const controller = new AbortController();
-    const timeout = window.setTimeout(
-      () => controller.abort(),
-      ROOM_BOOTSTRAP_TIMEOUT_MS,
-    );
-    try {
-      const response = await fetch('/api/room', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...body,
-          cursor: transportRef.current?.cursor,
-        }),
-        signal: controller.signal,
-      });
-      const data = (await response.json()) as RoomPostResponse;
-      if (!response.ok) {
-        const error = safeRoomError(data);
-        setRoomError(error);
-        return { ...data, error };
-      }
-      if (data.transport) {
-        const applied = ingest(data.transport);
-        if (applied && roomPausedRef.current !== applied.paused) {
-          roomPausedRef.current = applied.paused;
-          setPaused(applied.paused);
-        }
-        if (applied?.game && (applied.started || data.started)) {
-          sharedRef.current = true;
-          if (!startedRef.current) setStarted(true);
-        }
-      }
-      return data;
-    } catch {
-      const error = 'Комната временно недоступна. Попробуйте ещё раз.';
-      setRoomError(error);
-      return { error, code: 'room_error' };
-    } finally {
-      window.clearTimeout(timeout);
-    }
-  }
   async function sit(team: Team) {
     setRoomError('');
     const data = await roomPost({
@@ -1236,220 +1048,50 @@ export default function Home() {
         </section>
       </main>
     );
+  function switchSeatColor(team: Team) {
+    if (!seat) return;
+    void roomPost({ op: 'leave', playerId: seat.id }).then((left) => {
+      if (left.error) {
+        setRoomError(left.error);
+        return;
+      }
+      writeSavedSeat(null);
+      if (seatRef.current?.id === seat.id) seatRef.current = null;
+      transportRef.current = null;
+      void sit(team);
+    });
+  }
+
   if (!started)
     return (
-      <main className="start-screen">
-        {lobby?.startAt != null && (
-          <div className="start-countdown">
-            {Math.max(
-              1,
-              Math.ceil(
-                (lobby.startAt - (clock || Date.now())) / 1000,
-              ),
-            )}
-          </div>
-        )}
-        <div className="start-settings">
-          <button
-            className="square-button"
-            aria-label="Настройки"
-            onClick={() => setShowSettings(!showSettings)}
-          >
-            <Settings size={20} />
-          </button>
-          {showSettings && settingsPanel}
-        </div>
-        <div className="start-cloud">
-          <span>СТРАТЕГИЯ, В КОТОРОЙ ВЛАСТЬ МЕНЯЕТ ПРАВИЛА</span>
-        </div>
-        <div className="start-title">
-          <small>СОЛНЕЧНАЯ ДОЛИНА</small>
-          <h1>
-            FORGE<span>OF WILL</span>
-          </h1>
-          <p>
-            Развивай экономику. Стань лидером.
-            <br />
-            Напиши свой закон победы.
-          </p>
-        </div>
-        <div className="start-army" aria-hidden="true">
-          <img className="menu-tower red" src="/assets/tower.png" alt="" />
-          <img className="menu-tower blue" src="/assets/tower.png" alt="" />
-          <img className="menu-soldier" src="/assets/soldier.png" alt="" />
-        </div>
-        <section className="start-panel">
-          <div className="start-mode">
-            <Crown />
-            <span>
-              БИТВА ЗА ПРАВО ЖЕЛАНИЯ
-              <small>Один матч на всех · выберите свой цвет</small>
-            </span>
-          </div>
-          <label className="seat-name">
-            Имя
-            <input
-              value={callName}
-              maxLength={16}
-              onChange={(e) => setCallName(e.target.value)}
-            />
-          </label>
-          <div className="color-pick">
-            {TEAM_IDS.map((id) => {
-              const taken = lobby?.seats.find((s) => s.team === id);
-              const mine = seat?.team === id;
-              return (
-                <button
-                  key={id}
-                  type="button"
-                  className={picked === id || mine ? 'picked' : ''}
-                  style={{ background: TEAMS[id].color }}
-                  disabled={!!taken && !mine}
-                  onClick={() => {
-                    setPicked(id);
-                    if (mine || taken) return;
-                    if (!seat) {
-                      void sit(id);
-                      return;
-                    }
-                    void roomPost({ op: 'leave', playerId: seat.id }).then((left) => {
-                      if (left.error) {
-                        setRoomError(left.error);
-                        return;
-                      }
-                      writeSavedSeat(null);
-                      if (seatRef.current?.id === seat.id) seatRef.current = null;
-                      transportRef.current = null;
-                      return sit(id);
-                    });
-                  }}
-                >
-                  {TEAMS[id].name}
-                  <small>
-                    {mine
-                      ? lobby?.you?.ready
-                        ? 'готов'
-                        : 'вы'
-                      : taken
-                        ? taken.away
-                          ? `${taken.name} · нет связи`
-                          : taken.ready
-                            ? `${taken.name} · готов`
-                            : taken.name
-                        : 'свободен'}
-                  </small>
-                </button>
-              );
-            })}
-          </div>
-          {roomError && <p className="room-error">{roomError}</p>}
-          {seat ? (
-            <>
-              <button
-                className={`play-button ${lobby?.you?.ready ? 'is-ready' : ''}`}
-                onClick={() => void toggleReady()}
-              >
-                <Check /> {lobby?.you?.ready ? 'Отменить готовность' : 'Готов'}
-              </button>
-              <button className="solo-button" onClick={() => void releaseSeat()}>
-                Освободить место
-              </button>
-            </>
-          ) : (
-            <button className="play-button" onClick={() => void sit(picked)}>
-              <Play fill="currentColor" /> Сесть за {TEAMS[picked].name}
-            </button>
-          )}
-          <button className="solo-button" onClick={begin}>
-            Играть одному за синих
-          </button>
-          {lobby?.mutatorBanner && (
-            <p className="lobby-mutator">{lobby.mutatorBanner}</p>
-          )}
-          {seat &&
-            lobby?.startAt != null &&
-            (clock || Date.now()) < lobby.startAt - 3000 && (
-              <div className="lobby-chaos-ban">
-                <b>Бан хаоса (до 2 типов, 30 с)</b>
-                <div className="lobby-chaos-ban-grid">
-                  {CHAOS_EFFECT_KINDS.map((kind) => {
-                    const on = banDraft.includes(kind);
-                    return (
-                      <button
-                        key={kind}
-                        type="button"
-                        className={on ? 'on' : ''}
-                        onClick={() => {
-                          setBanDraft((prev) => {
-                            if (prev.includes(kind))
-                              return prev.filter((k) => k !== kind);
-                            if (prev.length >= 2) return prev;
-                            return [...prev, kind];
-                          });
-                        }}
-                      >
-                        {kind.replace(/^chaos_/, '').replaceAll('_', ' ')}
-                      </button>
-                    );
-                  })}
-                </div>
-                <button
-                  type="button"
-                  className="solo-button"
-                  disabled={!banDraft.length}
-                  onClick={() =>
-                    void roomPost({
-                      op: 'chaos-ban',
-                      playerId: seat.id,
-                      kinds: banDraft,
-                    })
-                  }
-                >
-                  Сохранить бан
-                </button>
-                {lobby.chaosBans?.[seat.team]?.length ? (
-                  <small>
-                    Ваш бан:{' '}
-                    {lobby.chaosBans[seat.team]!
-                      .map((k) => k.replace(/^chaos_/, ''))
-                      .join(', ')}
-                  </small>
-                ) : null}
-              </div>
-            )}
-          {!!lobby?.seats.length && (
-            <ul className="ready-list">
-              {lobby.seats.map((s) => (
-                <li key={s.team}>
-                  <i style={{ background: TEAMS[s.team].color }} />
-                  {s.name}
-                  <b>{s.away ? 'нет связи' : s.ready ? 'готов' : 'ждёт'}</b>
-                </li>
-              ))}
-            </ul>
-          )}
-          <p>
-            {lobby?.startAt
-              ? `Все готовы. Общий старт через ${Math.max(1, Math.ceil((lobby.startAt - (clock || Date.now())) / 1000))} с.`
-              : (lobby?.seats.length ?? 0) < 2
-                ? 'Нужны минимум двое. Каждый выбирает свой цвет и нажимает «Готов».'
-                : 'Бой начнётся, когда готов каждый, кто сел за стол. Свободный цвет может занять друг. Пустой цвет станет ботом, только если к старту в нём нет человека.'}
-          </p>
-          <div className="start-rules">
-            <span>
-              <Flag /> Захватывай здания
-            </span>
-            <span>
-              <Crown /> Удерживай лидерство
-            </span>
-            <span>
-              <Sparkles /> Меняй правила
-            </span>
-          </div>
-          <p>Первые 4 минуты — развитие. Затем власть у самого богатого.</p>
-        </section>
-        <div className="start-bottom">Каждый матч — новая история</div>
-      </main>
+      <LobbyPanel
+        lobby={lobby}
+        clock={clock}
+        callName={callName}
+        setCallName={setCallName}
+        picked={picked}
+        setPicked={setPicked}
+        seat={seat}
+        roomError={roomError}
+        showSettings={showSettings}
+        setShowSettings={setShowSettings}
+        settingsPanel={settingsPanel}
+        banDraft={banDraft}
+        setBanDraft={setBanDraft}
+        onSit={(team) => void sit(team)}
+        onSwitchColor={switchSeatColor}
+        onToggleReady={() => void toggleReady()}
+        onReleaseSeat={() => void releaseSeat()}
+        onBeginSolo={begin}
+        onChaosBan={(kinds) => {
+          if (!seat) return;
+          void roomPost({
+            op: 'chaos-ban',
+            playerId: seat.id,
+            kinds,
+          });
+        }}
+      />
     );
   return (
     <main className="war-shell">
@@ -2330,73 +1972,12 @@ export default function Home() {
           )}
         </section>
       )}
-            <div className="hud-notifications" aria-live="polite">
-        <div className="battle-notice">
-          <span className="notice-dot" />
-          <p>{game.notice}</p>
-          <span className="captured-count">
-            <Flag size={15} />
-            {yours.length} / {game.towers.length}
-          </span>
-        </div>
-      {game.event && !game.event.claimed && (
-        <button
-          className="event-notice"
-          onClick={() => focusPoint(game.event!.x, game.event!.y)}
-        >
-          {game.event.kind === 'deposit'
-            ? '💎 Жила ×3'
-            : game.event.kind === 'fortress'
-              ? '⚑ Форт +50'
-              : '💰 Караван'}{' '}
-          · {Math.ceil(game.event.until - game.age)} с ↗
-        </button>
-      )}
-      {game.spell && (
-        <output className="spell-toast">
-          <div
-            className={`roulette-disc ${game.spell.patch || game.spell.roll === 'disabled' ? 'settled' : ''}`}
-          >
-            {game.spell.roll === 'debuff' ? '☠' : game.spell.patch ? '✦' : '?'}
-          </div>
-          <div>
-            <b>
-              {playerName(game, game.spell.team)}:{' '}
-              {game.spell.patch
-                ? (game.spell.debuff?.title ?? 'Без штрафа')
-                : game.spell.roll === 'disabled'
-                  ? 'Подготовка приказа'
-                  : 'Рулетка · DeepSeek'}
-            </b>
-            <small className="casting-prompt">{game.spell.prompt}</small>
-            <small>
-              {game.spell.patch
-                ? `${Math.max(0, Math.ceil((game.spell.castAt ?? game.age) - game.age))} с · удержите лидерство`
-                : 'Бой продолжается…'}
-            </small>
-            {game.spell.debuff && <p>{game.spell.debuff.description}</p>}
-          </div>
-        </output>
-      )}
-      {(game.curses ?? [])
-        .filter((c) => c.team === me)
-        .map((c, i) => (
-          <div
-            className="curse-toast"
-            key={`${c.at}-${i}`}
-            title={c.debuff.description}
-          >
-            ☠ {c.debuff.title} ·{' '}
-            {Math.ceil(
-              Math.max(
-                ...c.debuff.effects.map((e) => c.at + e.duration - game.age),
-              ),
-            )}{' '}
-            с
-          </div>
-        ))}
-
-      </div>
+      <MatchHud
+        game={game}
+        me={me}
+        yoursCount={yours.length}
+        focusPoint={(x, y) => focusPoint(x, y)}
+      />
       {game.minesweeper && game.age < game.minesweeper.until && (
         <aside className="replay-mines" aria-label="Сапёр соперников">
           {game.minesweeper.boards.map(board => {

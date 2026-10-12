@@ -28,12 +28,21 @@ import {
   type Target,
 } from './decrees';
 import { proceduralDebuff, validDebuff, type Debuff } from './magic';
+import { isFairModeBlockedInstant } from './chaos-registry';
+import {
+  chaosMineBirthEligible,
+  garrisonRecruitAllowed,
+} from './economy-rules';
 import {
   decreeHasInstantReveal,
   troopVariantFor,
   updateEpochObjective,
-  variantSpeedMult,
 } from './match-meta';
+import {
+  DEFAULT_TROOP_RULES,
+  roleMult,
+  variantSpeedMult,
+} from './troop-rules';
 export type Team = 'you' | 'red' | 'purple' | 'green';
 export type Kind =
   | 'tower'
@@ -196,6 +205,8 @@ export type Game = {
   mapMutation?: import('./match-meta').MapMutation;
   matchMutator?: import('./match-meta').MatchMutator;
   roomSeed?: number;
+  /** Ranked-style: no map mutation, no instant land-flip chaos. */
+  fairMode?: boolean;
   bannedChaos?: import('./chaos-rules').ChaosEffectKind[];
   teamVetoUsed?: Partial<Record<Team, boolean>>;
   spellVetoDelay?: number;
@@ -217,6 +228,15 @@ export const DECREE_RESPONSE_SECONDS = 30;
 export const WORLD_WIDTH = 2400;
 export const WORLD_HEIGHT = 1700;
 const MOVE_SPEED = 2.2;
+
+function troopEliteMult(p: Troop): number {
+  return p.elite ? DEFAULT_TROOP_RULES.eliteStrengthMult : 1;
+}
+
+function troopStrike(p: Troop): number {
+  return p.strength * troopEliteMult(p);
+}
+
 function worldSpan(ax: number, ay: number, bx: number, by: number) {
   return Math.hypot(
     ((ax - bx) / 100) * WORLD_WIDTH,
@@ -329,6 +349,7 @@ export function income(t: Tower) {
   };
 }
 export function production(t: Tower) {
+  if (!garrisonRecruitAllowed(t)) return 0;
   return (
     (t.specialty === 'swarm' ? 1.6 : t.specialty === 'elite' ? 0.65 : 1) *
     (t.home
@@ -437,39 +458,45 @@ export function dispatch(
     : Math.floor(Math.min(limit, source.count * sendFraction));
   if (amount < 1) return g;
   const team = source.team,
-    visualCount = Math.min(amount, 24);
+    visualCount = Math.min(amount, DEFAULT_TROOP_RULES.dispatchVisualCap);
   const troops = Array.from(
     { length: visualCount },
-    (_, i): Troop => ({
-      id: g.nextId + i,
-      strength: cargo
-        ? 8 + source.level * 2
-        : Math.floor(amount / visualCount) + (i < amount % visualCount ? 1 : 0),
-      team,
-      from,
-      to,
-      x: source.x,
-      y: source.y,
-      sx: source.x,
-      sy: source.y,
-      progress: 0,
-      delay: i * 0.2,
-      speech:
-        i === 0
-          ? cargo
-            ? 'Подкрепление в пути!'
-            : target.team === team
-              ? 'Держитесь, мы идём!'
-              : target.kind === 'gold'
-                ? 'Золото будет нашим!'
-                : target.kind === 'lumber'
-                  ? 'Нужна древесина!'
-                  : 'Выдвигаемся!'
-          : '',
-      cargo,
-      elite: source.specialty === 'elite',
-      variant: troopVariantFor(team, from, to, i, source.kind),
-    }),
+    (_, i): Troop => {
+      const variant = troopVariantFor(team, from, to, i, source, target, cargo);
+      const chunk =
+        Math.floor(amount / visualCount) + (i < amount % visualCount ? 1 : 0);
+      const strengthMult = cargo ? 1 : roleMult(variant, 'strength');
+      return {
+        id: g.nextId + i,
+        strength: cargo
+          ? 8 + source.level * 2
+          : Math.max(1, Math.floor(chunk * strengthMult)),
+        team,
+        from,
+        to,
+        x: source.x,
+        y: source.y,
+        sx: source.x,
+        sy: source.y,
+        progress: 0,
+        delay: i * 0.2,
+        speech:
+          i === 0
+            ? cargo
+              ? 'Подкрепление в пути!'
+              : target.team === team
+                ? 'Держитесь, мы идём!'
+                : target.kind === 'gold'
+                  ? 'Золото будет нашим!'
+                  : target.kind === 'lumber'
+                    ? 'Нужна древесина!'
+                    : 'Выдвигаемся!'
+            : '',
+        cargo,
+        elite: source.specialty === 'elite',
+        variant,
+      };
+    },
   );
   return {
     ...g,
@@ -613,7 +640,7 @@ export function upgrade(g: Game, id: number, actor: Team = 'you'): Game {
     ),
     notice: humanTeams(g).includes(actor)
       ? `${t.name}: уровень ${t.level + 1}. Добыча, вместимость и размер групп увеличены.`
-      : g.notice,
+      : `${playerName(g, actor)}: ${t.name} → ур. ${t.level + 1}`,
   };
 }
 export function setAutomation(
@@ -1140,11 +1167,14 @@ export function tick(previous: Game, dt = 0.05): Game {
       shot.hit = true;
       const victim =
         shot.target == null ? undefined : troopById.get(shot.target);
-      if (victim && victim.team !== shot.team)
+      if (victim && victim.team !== shot.team) {
+        const exposure = roleMult(victim.variant, 'cannonExposure');
         victim.strength = Math.max(
           0,
-          victim.strength - (shot.damage ?? 1) * (victim.elite ? 0.6 : 1),
+          victim.strength -
+            (shot.damage ?? 1) * (victim.elite ? 0.6 : 1) * exposure,
         );
+      }
     }
   }
   const byId: Tower[] = [];
@@ -1406,8 +1436,8 @@ export function tick(previous: Game, dt = 0.05): Game {
       )
     ) {
       const heal =
-        (p.strength *
-          (p.elite ? 2 : 1) *
+        (troopStrike(p) *
+          roleMult(p.variant, 'capture') *
           chaosCaptureMult(g.chaosRules, g.age, p.team)) /
         2;
       target.count = Math.min(capacity(target), target.count + heal);
@@ -1419,8 +1449,8 @@ export function tick(previous: Game, dt = 0.05): Game {
       target.count = Math.max(
         0,
         target.count -
-          p.strength *
-            (p.elite ? 2 : 1) *
+          troopStrike(p) *
+            roleMult(p.variant, 'capture') *
             chaosCaptureMult(g.chaosRules, g.age, p.team) *
             debuffCaptureFactor(g, p.team),
       );
@@ -1433,8 +1463,8 @@ export function tick(previous: Game, dt = 0.05): Game {
       }
     } else {
       target.count -=
-        (p.strength *
-          (p.elite ? 2 : 1) *
+        (troopStrike(p) *
+          roleMult(p.variant, 'capture') *
           chaosCaptureMult(g.chaosRules, g.age, p.team) *
           debuffCaptureFactor(g, p.team)) /
         ((1 + (target.level - 1) * 0.12) *
@@ -1623,7 +1653,11 @@ export function tick(previous: Game, dt = 0.05): Game {
         ? ['gold', 'lumber'].includes(t.kind)
         : !t.home && !t.team,
     );
-    const target = candidates[index % candidates.length];
+    const pickSeed =
+      ((g.roomSeed ?? 0) ^ Math.imul(index + 1, 2654435761)) >>> 0;
+    const target = candidates.length
+      ? candidates[pickSeed % candidates.length]
+      : undefined;
     g.event = {
       kind: target ? kind : 'caravan',
       target: target?.id,
@@ -1633,9 +1667,13 @@ export function tick(previous: Game, dt = 0.05): Game {
     };
     g.eventIndex = index + 1;
     g.eventAt = g.age + 85;
+    const depositOwner =
+      target?.team && kind === 'deposit'
+        ? `${playerName(g, target.team)} · `
+        : '';
     g.notice =
       kind === 'deposit'
-        ? 'Богатая жила: добыча ×3 на 50 с'
+        ? `Богатая жила ×3 (${depositOwner}${target?.name ?? 'точка'}) · 50 с`
         : kind === 'fortress'
           ? 'Захватите древний форт: +50 бойцов'
           : 'Золотой караван в центре: перехватите 150 золота';
@@ -1803,6 +1841,12 @@ function matches(t: Tower, target: Target, actor: Team): boolean {
 }
 
 function applyChaosInstant(next: Game, caster: Team, a: Action): string | null {
+  if (
+    next.fairMode &&
+    isChaosKind(a.kind) &&
+    isFairModeBlockedInstant(a.kind)
+  )
+    return null;
   const param = a.param ?? 0;
   if (a.kind === 'chaos_neutral_uprising') {
     let touched = 0;
@@ -1858,20 +1902,19 @@ function applyChaosInstant(next: Game, caster: Team, a: Action): string | null {
     return `Перекраска: ${swaps} зданий поменялись с ${victim}`;
   }
   if (a.kind === 'chaos_mine_birth') {
-    const mines = next.towers.filter(
-      (t) =>
-        t.team === caster &&
-        t.ruinedAt === undefined &&
-        ['gold', 'lumber', 'barracks'].includes(t.kind),
+    const sites = next.towers.filter(
+      (t) => t.team === caster && chaosMineBirthEligible(t),
     );
     let left = param;
-    for (const t of mines) {
+    for (const t of sites) {
       if (left <= 0) break;
-      const chunk = Math.max(1, Math.floor(param / Math.max(1, mines.length)));
+      const chunk = Math.max(1, Math.floor(param / Math.max(1, sites.length)));
       addGarrison(t, Math.min(left, chunk));
       left -= chunk;
     }
-    return `Шахты и казармы выплюнули ${param} бойцов`;
+    return sites.length
+      ? `Казармы и форты выплюнули ${param} бойцов`
+      : 'Рождение гарнизона: нет подходящих зданий';
   }
   if (a.kind === 'chaos_building_shuffle') {
     const mobile = next.towers.filter((t) => !t.home && t.ruinedAt === undefined);

@@ -1,4 +1,5 @@
 import type { ChaosEffectKind } from './chaos-rules';
+import { defaultFairChaosMode } from './chaos-registry';
 import {
   bootstrapMatch,
   stableRoomSeed,
@@ -176,8 +177,9 @@ function launch(current: Room, now: number) {
   const humans = current.seats.map((s) => s.team);
   const banned = unionChaosBans(current.chaosBans, humans);
   const mutator = weeklyMutator(now);
+  const fairMode = defaultFairChaosMode();
   let game = stampHumans(initialGame(), current.seats);
-  game = bootstrapMatch(game, seed, banned, mutator);
+  game = bootstrapMatch(game, seed, banned, mutator, fairMode);
   current.game = game;
   current.started = true;
   current.paused = false;
