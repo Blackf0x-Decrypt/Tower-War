@@ -33,7 +33,13 @@ import {
   type Recording,
   type ReplayState,
 } from '@/lib/replays';
-import { validDecree, type DecreeCandidate } from '@/lib/decrees';
+import {
+  gameDecreeContextSeed,
+  localDecreeCandidates,
+  sanitizeDecreeCandidates,
+  validPlayerDecree,
+  type DecreeCandidate,
+} from '@/lib/decrees';
 import { applyPlay, type PlayAction } from '@/lib/play';
 import { publishDrawSample } from '@/lib/draw-sample';
 import { reactStamp, retainBattle } from '@/lib/live-view';
@@ -193,6 +199,8 @@ export default function Home() {
   const [candidates, setCandidates] = useState<DecreeCandidate[]>([]);
   const [showCustom, setShowCustom] = useState(false);
   const pending = useRef<AbortController | null>(null);
+  const typingWindowEpoch = useRef<number | null>(null);
+  const candidatesEpoch = useRef<number | null>(null);
   const spellFlight = useRef<{
     abort: AbortController;
     start: Promise<{ nonce: number | null; epoch: number | null; error?: string }>;
@@ -511,6 +519,8 @@ export default function Home() {
   }, [typingDeadline]);
   useEffect(() => {
     if (!started || game.result || game.authority !== meRef.current) {
+      typingWindowEpoch.current = null;
+      candidatesEpoch.current = null;
       setTypingDeadline(0);
       setTypingSeconds(DECREE_RESPONSE_SECONDS);
       setDraft('');
@@ -524,12 +534,133 @@ export default function Home() {
       !game.result &&
       !developing &&
       game.authority === meRef.current &&
-      !typingDeadline
+      !typingDeadline &&
+      typingWindowEpoch.current !== game.authorityEpoch
     ) {
-      setTypingDeadline(Date.now() + DECREE_RESPONSE_SECONDS * 1000);
-      setTypingSeconds(DECREE_RESPONSE_SECONDS);
+      const secondsLeft = Math.max(
+        0,
+        game.leaderSince + DECREE_RESPONSE_SECONDS - game.age,
+      );
+      if (!secondsLeft) return;
+      typingWindowEpoch.current = game.authorityEpoch;
+      candidatesEpoch.current = game.authorityEpoch;
+      setTypingDeadline(Date.now() + secondsLeft * 1000);
+      setTypingSeconds(secondsLeft);
+      setShowCustom(false);
+      setDraft('');
+      setPromptMessage('');
+      const leader = game.authority;
+      if (leader) {
+        const seed = gameDecreeContextSeed({
+          elapsed: game.elapsed,
+          towers: game.towers.filter((t) => t.team === leader).length,
+          earned: game.wallets[leader].earned,
+          epoch: game.authorityEpoch,
+        });
+        setCandidates(localDecreeCandidates(seed));
+        void refreshDecreeCandidates(seed, game.authorityEpoch);
+      }
     }
-  }, [started, game.result, game.authority, developing, typingDeadline]);
+  }, [
+    started,
+    game.result,
+    game.authority,
+    game.authorityEpoch,
+    game.leaderSince,
+    game.age,
+    game.elapsed,
+    game.towers,
+    game.wallets,
+    developing,
+    typingDeadline,
+  ]);
+  async function refreshDecreeCandidates(seed: string, epoch: number) {
+    const request = new AbortController();
+    pending.current?.abort();
+    pending.current = request;
+    setBusy(true);
+    try {
+      const response = await fetch('/api/decree', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'candidates', context: seed }),
+        signal: request.signal,
+      });
+      const data = (await response.json()) as {
+        error?: string;
+        provider?: string;
+        candidates?: unknown;
+      };
+      if (pending.current !== request || request.signal.aborted) return;
+      if (gameRef.current.authorityEpoch !== epoch) return;
+      if (!response.ok) {
+        if (data.error) setPromptMessage(data.error);
+        return;
+      }
+      if (data.provider === 'deepseek') setProvider('deepseek');
+      const available = sanitizeDecreeCandidates(data.candidates);
+      if (available.length === 3) {
+        setCandidates(available);
+        setPromptMessage('Выберите один из трёх указов или напишите свой.');
+      }
+    } catch {
+      if (
+        !request.signal.aborted &&
+        gameRef.current.authorityEpoch === epoch
+      )
+        setPromptMessage(
+          'Не удалось обновить варианты. Локальные карточки остаются.',
+        );
+    } finally {
+      if (pending.current === request) {
+        pending.current = null;
+        setBusy(false);
+      }
+    }
+  }
+  useEffect(() => {
+    if (
+      !started ||
+      game.result ||
+      developing ||
+      game.authority !== meRef.current ||
+      !typingDeadline ||
+      paused ||
+      help ||
+      game.spell
+    )
+      return;
+    const epoch = game.authorityEpoch;
+    if (candidatesEpoch.current === epoch && candidates.length === 3) return;
+    if (candidatesEpoch.current === epoch) return;
+    candidatesEpoch.current = epoch;
+    setShowCustom(false);
+    setDraft('');
+    const leader = game.authority;
+    if (!leader) return;
+    const seed = gameDecreeContextSeed({
+      elapsed: game.elapsed,
+      towers: game.towers.filter((t) => t.team === leader).length,
+      earned: game.wallets[leader].earned,
+      epoch,
+    });
+    setCandidates(localDecreeCandidates(seed));
+    void refreshDecreeCandidates(seed, epoch);
+  }, [
+    started,
+    game.result,
+    developing,
+    game.authority,
+    game.authorityEpoch,
+    typingDeadline,
+    paused,
+    help,
+    game.spell,
+    game.elapsed,
+    game.towers,
+    game.wallets,
+    candidates.length,
+  ]);
   const blockPaste = (e: React.SyntheticEvent) => {
     e.preventDefault();
     setPromptMessage('Приказ нужно набрать вручную. Вставка отключена.');
@@ -650,8 +781,16 @@ export default function Home() {
   const me: Team = seat?.team ?? 'you';
   meRef.current = me;
   const source = game.towers.find((t) => t.id === selected && t.team === me);
+  const decreeWindowOpen =
+    game.age < game.leaderSince + DECREE_RESPONSE_SECONDS;
   const canIssueDecree =
-    !roomError && !developing && game.authority === me;
+    !roomError && !developing && decreeWindowOpen && game.authority === me;
+  const decreeOverlayOpen =
+    canIssueDecree &&
+    !!typingDeadline &&
+    !paused &&
+    !help &&
+    !game.spell;
   const developmentLeft = Math.max(
     0,
     Math.ceil(DEVELOPMENT_SECONDS - game.age),
@@ -944,88 +1083,16 @@ export default function Home() {
   towerHandlers.current.scout = (from, x, y) => {
     play({ type: 'scout', from, x, y });
   };
-  async function submitPrompt(e: React.FormEvent) {
-    e.preventDefault();
-    const current = gameRef.current;
-    if (!typingDeadline || Date.now() >= typingDeadline) {
-      setTypingDeadline(0);
-      setDraft('');
-      setPromptMessage('Время ввода истекло. Наберите приказ заново.');
-      return;
-    }
-    if (recording || paused || help || current.result) return;
-    if (current.age < DEVELOPMENT_SECONDS) return;
-    if (
-      pending.current ||
-      current.authority !== me ||
-      current.result ||
-      current.spell ||
-      paused ||
-      help ||
-      !draft.trim()
-    )
-      return;
-    const submittedDraft = draft.trim();
-    const request = new AbortController();
-    pending.current = request;
-    setBusy(true);
-    setPromptMessage('');
-    try {
-      const response = await fetch('/api/decree', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: submittedDraft }),
-        signal: request.signal,
-      });
-      const data = (await response.json()) as {
-        error?: string;
-        provider?: string;
-        candidates?: unknown;
-      };
-      if (pending.current !== request || request.signal.aborted) return;
-      if (!response.ok) {
-        setPromptMessage(data.error || 'Приказ не применён.');
-        return;
-      }
-      if (data.provider === 'deepseek') setProvider('deepseek');
-      const available = Array.isArray(data.candidates)
-        ? data.candidates.filter(
-            (candidate): candidate is DecreeCandidate =>
-              !!candidate &&
-              typeof candidate === 'object' &&
-              typeof candidate.title === 'string' &&
-              typeof candidate.flavor === 'string' &&
-              typeof candidate.description === 'string' &&
-              typeof candidate.sideEffect === 'string' &&
-              validDecree((candidate as DecreeCandidate).patch),
-          )
-        : [];
-      if (available.length !== 3) {
-        setPromptMessage('Не удалось подготовить три безопасных варианта.');
-        return;
-      }
-      setCandidates(available);
-      setShowCustom(false);
-      setPromptMessage('Выберите один из трёх указов или напишите свой.');
-    } catch {
-      if (!request.signal.aborted)
-        setPromptMessage('Не удалось отправить приказ. Попробуйте снова.');
-    } finally {
-      if (pending.current === request) {
-        pending.current = null;
-        setBusy(false);
-      }
-    }
-  }
   async function selectCandidate(candidate: DecreeCandidate) {
     const current = gameRef.current;
     if (
       !typingDeadline ||
       Date.now() >= typingDeadline ||
       current.authority !== me ||
+      current.age >= current.leaderSince + DECREE_RESPONSE_SECONDS ||
       current.result ||
       current.spell ||
-      !validDecree(candidate.patch)
+      !validPlayerDecree(candidate.patch)
     )
       return;
     setBusy(true);
@@ -1065,7 +1132,7 @@ export default function Home() {
       const response = await fetch('/api/decree', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: draft.trim(), custom: true }),
+        body: JSON.stringify({ action: 'custom', prompt: draft.trim() }),
       });
       const data = (await response.json()) as {
         error?: string;
@@ -1076,7 +1143,7 @@ export default function Home() {
         !response.ok ||
         !custom ||
         typeof custom.title !== 'string' ||
-        !validDecree(custom.patch)
+        !validPlayerDecree(custom.patch)
       ) {
         setPromptMessage(data.error || 'Своя формулировка не подходит правилам указа.');
         return;
@@ -1656,6 +1723,138 @@ export default function Home() {
             {speech ? <Volume2 size={18} /> : <VolumeX size={18} />} Реплики
           </button>
           <TroopLayer camera={camera} viewport={viewport} speech={speech} paused={paused || help} />
+          {decreeOverlayOpen && (
+            <div
+              className="decree-overlay"
+              role="dialog"
+              aria-labelledby="decree-overlay-title"
+              aria-modal="true"
+            >
+              <section className="decree-overlay-card">
+                <header className="decree-overlay-head">
+                  <span className="eyebrow">ПРАВО ЛИДЕРА</span>
+                  <h2 id="decree-overlay-title">Ваш указ · 30 секунд</h2>
+                  <span
+                    className={`decree-overlay-timer ${typingSeconds <= 3 ? 'urgent' : ''}`}
+                  >
+                    {typingSeconds.toFixed(1)} с
+                  </span>
+                </header>
+                {roomError && (
+                  <p className="room-error" role="alert">
+                    {roomError}
+                  </p>
+                )}
+                {!showCustom ? (
+                  <>
+                    <p className="decree-overlay-lead">
+                      Три готовых варианта с заранее показанным дополнительным
+                      эффектом. Можно выбрать сразу — печатать тему не нужно.
+                    </p>
+                    <div className="decree-candidates decree-candidates--overlay">
+                      {candidates.map((candidate) => (
+                        <button
+                          key={candidate.id}
+                          type="button"
+                          className="decree-candidate"
+                          disabled={busy || !!game.spell}
+                          onClick={() => void selectCandidate(candidate)}
+                        >
+                          <b>{candidate.title}</b>
+                          <small>{candidate.flavor}</small>
+                          <span>{candidate.description}</span>
+                          <em>{candidate.sideEffect}</em>
+                        </button>
+                      ))}
+                      <button
+                        type="button"
+                        className="decree-candidate decree-candidate--custom"
+                        disabled={busy || !!game.spell}
+                        onClick={() => {
+                          setShowCustom(true);
+                          setDraft('');
+                        }}
+                      >
+                        <b>Написать свой приказ</b>
+                        <small>Только ваш штаб и ваша команда.</small>
+                        <span>Подкрепление, золото, древесина или щит.</span>
+                      </button>
+                    </div>
+                    {busy && candidates.length < 3 && (
+                      <p className="decree-overlay-status">Подгружаем варианты…</p>
+                    )}
+                  </>
+                ) : (
+                  <form
+                    onSubmit={submitCustom}
+                    className="custom-decree decree-overlay-custom"
+                  >
+                    <label htmlFor="custom-wish">
+                      Свой указ: подкрепление, золото, древесина или щит для
+                      вашей команды.
+                    </label>
+                    <div className="wish-input">
+                      <textarea
+                        id="custom-wish"
+                        value={draft}
+                        disabled={busy || !!game.spell}
+                        onPaste={blockPaste}
+                        onDrop={blockPaste}
+                        onDragOver={(e) => e.preventDefault()}
+                        onBeforeInput={(e) => {
+                          if (
+                            [
+                              'insertFromPaste',
+                              'insertFromDrop',
+                              'insertFromYank',
+                            ].includes((e.nativeEvent as InputEvent).inputType)
+                          )
+                            blockPaste(e);
+                        }}
+                        onKeyDown={(e) => {
+                          if (
+                            ((e.ctrlKey || e.metaKey) &&
+                              e.key.toLowerCase() === 'v') ||
+                            (e.shiftKey && e.key === 'Insert')
+                          )
+                            blockPaste(e);
+                        }}
+                        onChange={(e) => setDraft(e.target.value)}
+                        maxLength={350}
+                        rows={3}
+                        placeholder="Введите приказ…"
+                        autoFocus
+                      />
+                      <button type="submit" disabled={busy || !draft.trim()}>
+                        Проверить и исполнить
+                      </button>
+                    </div>
+                    <button
+                      type="button"
+                      className="decree-back"
+                      onClick={() => setShowCustom(false)}
+                    >
+                      ← К готовым вариантам
+                    </button>
+                  </form>
+                )}
+                <footer className="decree-overlay-foot">
+                  <span>
+                    {provider === 'deepseek'
+                      ? 'DeepSeek может обновить карточки'
+                      : provider === 'loading'
+                        ? 'Проверяем связь…'
+                        : 'Локальные варианты всегда доступны'}
+                  </span>
+                  {promptMessage && (
+                    <p className="prompt-feedback" role="status">
+                      {promptMessage}
+                    </p>
+                  )}
+                </footer>
+              </section>
+            </div>
+          )}
           {!recording && (paused || help || game.result) && (
             <div className="game-overlay">
               <section className="overlay-card">
@@ -2279,130 +2478,11 @@ export default function Home() {
           !game.result ? (
             <>
             {canIssueDecree && (
-            <form onSubmit={submitPrompt}>
-              <label htmlFor="wish">
-                Опишите тему указа — появятся три точных варианта с заранее
-                показанным дополнительным эффектом.
-              </label>
-              <div className="wish-input">
-                <textarea
-                  id="wish"
-                  value={draft}
-                  disabled={paused || help || busy || !!game.spell}
-                  onPaste={blockPaste}
-                  onDrop={blockPaste}
-                  onDragOver={(e) => e.preventDefault()}
-                  onBeforeInput={(e) => {
-                    if (
-                      [
-                        'insertFromPaste',
-                        'insertFromDrop',
-                        'insertFromYank',
-                      ].includes((e.nativeEvent as InputEvent).inputType)
-                    )
-                      blockPaste(e);
-                  }}
-                  onKeyDown={(e) => {
-                    if (
-                      ((e.ctrlKey || e.metaKey) &&
-                        e.key.toLowerCase() === 'v') ||
-                      (e.shiftKey && e.key === 'Insert')
-                    )
-                      blockPaste(e);
-                  }}
-                  onChange={(e) => {
-                    setDraft(e.target.value);
-                  }}
-                  maxLength={350}
-                  rows={2}
-                  placeholder="Введите приказ…"
-                />
-                <button
-                  type="submit"
-                  disabled={
-                    paused || help || busy || !!game.spell || !draft.trim()
-                  }
-                >
-                  <Send size={20} />
-                  {busy ? 'Колдуем…' : 'ИСПОЛНИТЬ'}
-                </button>
-              </div>
-              <div className="wish-meta">
-                <span>
-                  {busy
-                    ? 'Бой продолжается. Удерживайте лидерство…'
-                    : provider === 'deepseek'
-                      ? 'DeepSeek предлагает варианты в рамках правил'
-                      : provider === 'loading'
-                        ? 'Проверяем связь…'
-                        : 'Локальные варианты готовы даже без DeepSeek'}
-                </span>
-                <span
-                  className={`typing-clock ${typingSeconds <= 3 ? 'urgent' : ''}`}
-                >
-                  {busy
-                    ? 'Приказ отправлен'
-                    : typingDeadline
-                      ? `${typingSeconds.toFixed(1)} с`
-                      : '30 с на выбор · без вставки'}{' '}
-                  · {draft.length}/350
-                </span>
-              </div>
-              {candidates.length === 3 && (
-                <div className="decree-candidates">
-                  {candidates.map((candidate) => (
-                    <button
-                      key={candidate.id}
-                      type="button"
-                      disabled={busy || !!game.spell}
-                      onClick={() => void selectCandidate(candidate)}
-                    >
-                      <b>{candidate.title}</b>
-                      <small>{candidate.flavor}</small>
-                      <span>{candidate.description}</span>
-                      <em>{candidate.sideEffect}</em>
-                    </button>
-                  ))}
-                  <button
-                    type="button"
-                    onClick={() => setShowCustom(true)}
-                    disabled={busy || !!game.spell}
-                  >
-                    <b>Своя формулировка</b>
-                    <small>Только ваш штаб и ваша команда.</small>
-                  </button>
-                </div>
-              )}
-              <div className="wish-examples">
-                <span>Попробуй:</span>
-                {[
-                  'Все красные теперь мои',
-                  'Уничтожь красных',
-                  'Заморозь врагов на 30 секунд',
-                ].map((text) => (
-                  <span key={text}>{text}</span>
-                ))}
-              </div>
-            </form>
-            )}
-            {canIssueDecree && showCustom && (
-              <form onSubmit={submitCustom} className="custom-decree">
-                <label htmlFor="custom-wish">
-                  Свой указ: подкрепление, золото, древесина или щит для вашей команды.
-                </label>
-                <div className="wish-input">
-                  <textarea
-                    id="custom-wish"
-                    value={draft}
-                    onChange={(e) => setDraft(e.target.value)}
-                    maxLength={350}
-                    rows={2}
-                  />
-                  <button type="submit" disabled={busy || !draft.trim()}>
-                    Проверить и исполнить
-                  </button>
-                </div>
-              </form>
+              <p className="locked-description decree-corner-hint">
+                {decreeOverlayOpen
+                  ? 'Выбор указа — по центру поля боя. Удерживайте лидерство.'
+                  : 'Окно указа откроется, когда вы станете единственным лидером.'}
+              </p>
             )}
             {messageMode && (
               <form onSubmit={submitMessage}>

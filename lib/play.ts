@@ -1,5 +1,5 @@
 import type { Decree } from './decrees';
-import { validDecree } from './decrees';
+import { validPlayerDecree } from './decrees';
 import { validDebuff, type Debuff } from './magic';
 import {
   configureAutomation,
@@ -92,7 +92,7 @@ export function applyPlay(g: Game, actor: Team, action: PlayAction): Game {
         ? startSpell(g, actor, action.text, action.roll || 'disabled')
         : g;
     case 'spell-ready':
-      if (g.spell?.team !== actor || !validDecree(action.patch)) return g;
+      if (g.spell?.team !== actor || !validPlayerDecree(action.patch)) return g;
       if (action.debuff !== null && !validDebuff(action.debuff)) return g;
       return readySpell(
         g,

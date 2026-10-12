@@ -27,6 +27,7 @@ import {
   initialGame,
   readySpell,
   recallTroops,
+  refreshAuthority,
   sendArmy,
   startSpell,
   teamIncome,
@@ -36,9 +37,14 @@ import {
 } from './tower-game';
 import {
   localCustomCandidate,
+  DEFAULT_DECREE_SEED,
+  decreePromptForCandidates,
+  gameDecreeContextSeed,
   localDecreeCandidates,
   localCustomDecree,
+  sanitizeDecreeCandidates,
   validDecree,
+  validPlayerDecree,
 } from './decrees';
 import { SEAT_AWAY_MS, SEAT_RELEASE_MS } from './room';
 import { battleRenderInput, reactStamp, skipBattleRender } from './live-view';
@@ -842,13 +848,55 @@ describe('room store', { concurrency: 1 }, () => {
     assert.deepEqual(incomes, [incomes[0], incomes[0], incomes[0], incomes[0]]);
   });
 
+  test('decree candidates without typed player prompt', () => {
+    const seed = decreePromptForCandidates(undefined, undefined);
+    assert.equal(seed, DEFAULT_DECREE_SEED);
+    const preset = localDecreeCandidates(seed);
+    assert.equal(preset.length, 3);
+    assert.ok(preset.every((choice) => validPlayerDecree(choice.patch)));
+    const contextual = localDecreeCandidates(
+      gameDecreeContextSeed({
+        elapsed: 260,
+        towers: 5,
+        earned: 88,
+        epoch: 3,
+      }),
+    );
+    assert.equal(contextual.length, 3);
+    assert.ok(contextual.every((choice) => validPlayerDecree(choice.patch)));
+    const unsafe = sanitizeDecreeCandidates([
+      preset[0],
+      {
+        ...preset[1],
+        patch: { kind: 'reinforce', target: 'everyone', amount: 25 },
+      },
+      preset[2],
+    ]);
+    assert.equal(unsafe.length, 0);
+  });
+
   test('decree choice window, fallback candidates, custom DSL, and leadership guard', () => {
     const choices = localDecreeCandidates('укрепить рубеж');
     assert.equal(choices.length, 3);
     assert.ok(choices.every((choice) => validDecree(choice.patch)));
+    assert.ok(choices.every((choice) => validPlayerDecree(choice.patch)));
     assert.ok(choices.every((choice) => choice.sideEffect.length > 0));
-    assert.ok(validDecree(localCustomDecree('дай штабу 20')!));
+    assert.ok(validDecree(localCustomDecree('ускорить марш')!));
+    assert.ok(validPlayerDecree(localCustomDecree('ускорить марш')!));
+    assert.ok(validPlayerDecree(localCustomDecree('дай штабу 20')!));
     assert.equal(localCustomDecree('уничтожь красных'), null);
+    assert.ok(validPlayerDecree(localCustomDecree('туман войны')!));
+    assert.ok(validPlayerDecree(localCustomDecree('монополия дохода')!));
+    assert.ok(validPlayerDecree(localCustomDecree('зеркальная волна')!));
+    assert.ok(validPlayerDecree(localCustomDecree('перекраска карты')!));
+    assert.ok(validPlayerDecree(localCustomDecree('рой автовыбросов')!));
+    assert.ok(
+      choices.every(
+        (choice) =>
+          !JSON.stringify(choice.patch).includes('"kind":"gold"') ||
+          choice.title.includes('Ваш'),
+      ),
+    );
     assert.ok(localCustomCandidate('дай штабу 20')?.sideEffect.length);
 
     let game = initialGame();
@@ -858,11 +906,48 @@ describe('room store', { concurrency: 1 }, () => {
       elapsed: DEVELOPMENT_SECONDS,
       authority: 'you',
       authorityEpoch: 4,
+      leaderSince: DEVELOPMENT_SECONDS,
       wallets: {
         ...game.wallets,
         you: { ...game.wallets.you, earned: 100 },
       },
     };
+    const deepSeekGlobalCandidate = {
+      id: 'unsafe',
+      title: 'Всем поровну',
+      flavor: 'Небезопасный ответ модели.',
+      description: '+25 бойцов всем.',
+      sideEffect: 'Без довеска.',
+      patch: { kind: 'reinforce' as const, target: 'everyone' as const, amount: 25 },
+    };
+    assert.ok(validDecree(deepSeekGlobalCandidate.patch));
+    assert.equal(validPlayerDecree(deepSeekGlobalCandidate.patch), false);
+    const redHqBefore = game.towers.find((tower) => tower.home === 'red')!.count;
+    const rejectedGlobal = applyDecree(
+      game,
+      'you',
+      deepSeekGlobalCandidate.patch,
+      4,
+    );
+    assert.equal(
+      rejectedGlobal.towers.find((tower) => tower.home === 'red')!.count,
+      redHqBefore,
+    );
+    const expiredWindow = startSpell(
+      { ...game, age: DEVELOPMENT_SECONDS + DECREE_RESPONSE_SECONDS },
+      'you',
+      choices[0].title,
+    );
+    assert.equal(expiredWindow.spell, undefined);
+    const tied = refreshAuthority({
+      ...game,
+      wallets: {
+        ...game.wallets,
+        red: { ...game.wallets.red, earned: 100 },
+      },
+    });
+    assert.equal(tied.authority, null);
+    assert.equal(tied.authorityEpoch, 5);
     game = startSpell(game, 'you', choices[0].title);
     assert.ok(game.spell);
     const expired = tick(
@@ -880,15 +965,48 @@ describe('room store', { concurrency: 1 }, () => {
       'disabled',
     );
     assert.ok(armed.spell?.patch);
-    const hqBefore = armed.towers.find((tower) => tower.home === 'you')!.count;
     const applied = applyDecree(
       { ...armed, spell: undefined },
       'you',
       choices[0].patch,
       4,
     );
-    const hqAfter = applied.towers.find((tower) => tower.home === 'you')!.count;
-    assert.ok(hqAfter > hqBefore);
+    assert.ok(applied.decreeLog[0]?.text.length > 0);
+    assert.ok(
+      (applied.chaosRules?.length ?? 0) > 0 ||
+        (applied.shielded?.you ?? 0) > applied.age ||
+        applied.decreeLog[0].text.includes('Нейтралы') ||
+        applied.decreeLog[0].text.includes('Переставлено'),
+    );
+    assert.equal(
+      applied.towers.find((tower) => tower.home === 'red')!.count,
+      redHqBefore,
+    );
+    const rippleGame = {
+      ...game,
+      spell: undefined,
+      authority: 'you' as const,
+      authorityEpoch: game.authorityEpoch,
+    };
+    const ripplePatch = localCustomDecree('волна нейтралов от штаба')!;
+    const rippled = applyDecree(
+      rippleGame,
+      'you',
+      ripplePatch,
+      rippleGame.authorityEpoch,
+    );
+    assert.ok(
+      rippled.decreeLog.some((entry) => entry.text.includes('Волна')) ||
+        rippled.decreeLog.some((entry) => entry.text.includes('нейтрал')),
+    );
+    const monopolyPatch = localCustomDecree('монополия дохода')!;
+    const monopolized = applyDecree(
+      { ...rippleGame, decreeLog: [] },
+      'you',
+      monopolyPatch,
+      rippleGame.authorityEpoch,
+    );
+    assert.ok((monopolized.chaosRules?.length ?? 0) > 0);
     const lostLead = { ...game, authority: 'red' as const, authorityEpoch: 5 };
     const rejected = readySpell(
       lostLead,
@@ -1223,6 +1341,44 @@ describe('seat release and four players', { concurrency: 1 }, () => {
     assert.equal(rejoin.seats?.length, 0);
   });
 
+  test('leaving mid-decree cancels an armed spell for that team', async () => {
+    const kv = memory();
+    const leader = await roomCommand({ op: 'join', team: 'you', name: 'Анна' });
+    const ally = await roomCommand({ op: 'join', team: 'red', name: 'Борис' });
+    await roomCommand({ op: 'ready', playerId: leader.playerId });
+    await roomCommand({ op: 'ready', playerId: ally.playerId });
+    await saveGame(kv, (room) => {
+      room.startAt = Date.now() - 5;
+    });
+    await saveGame(kv, (room) => {
+      room.paused = true;
+      room.game.age = DEVELOPMENT_SECONDS;
+      room.game.elapsed = DEVELOPMENT_SECONDS;
+      room.game.authority = 'you';
+      room.game.authorityEpoch = 2;
+      room.game.leaderSince = DEVELOPMENT_SECONDS;
+      room.game.wallets.you.earned = 500;
+      room.game.spell = {
+        team: 'you',
+        epoch: 2,
+        prompt: 'Тест',
+        startedAt: DEVELOPMENT_SECONDS,
+        patch: { kind: 'reinforce', target: 'main', amount: 20 },
+        castAt: DEVELOPMENT_SECONDS + 12,
+        roll: 'disabled',
+        nonce: 1,
+      };
+    });
+    const left = await roomCommand({
+      op: 'leave',
+      playerId: leader.playerId,
+    });
+    assert.equal(left.error, undefined);
+    const saved = roomFromJson((await kv.get(ROOM_KEY))!);
+    assert.equal(saved.game.spell, undefined);
+    assert.equal(saved.game.humans?.includes('you'), false);
+  });
+
   test('a started match releases a stale seat and does not let a stranger take it', async () => {
     const kv = memory();
     const anna = await roomCommand({ op: 'join', team: 'you', name: 'Анна' });
@@ -1317,6 +1473,7 @@ describe('seat release and four players', { concurrency: 1 }, () => {
       room.game.age = DEVELOPMENT_SECONDS;
       room.game.elapsed = DEVELOPMENT_SECONDS;
       room.game.authority = null;
+      room.game.leaderSince = DEVELOPMENT_SECONDS;
       room.game.wallets.you.earned = 900;
       room.game.wallets.red.earned = 1;
       room.game.wallets.purple.earned = 1;

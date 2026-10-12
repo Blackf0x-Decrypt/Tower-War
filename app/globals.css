@@ -96,7 +96,9 @@ html,body{background:#a3ce57 url('/assets/battlefield.png') center/cover fixed n
 .color-pick button small{display:block;font-size:10px;font-weight:700;opacity:.9}
 .color-pick button.picked{border-color:#fff4c8;box-shadow:0 0 0 3px #8a5a20}
 .color-pick button:disabled{opacity:.45}
-.solo-button{display:block;width:100%;min-height:42px;margin-top:10px;padding:9px 12px;background:transparent;border:0;color:#8a6436;font-weight:800;line-height:1.25;text-align:center;text-decoration:underline;white-space:nowrap}
+.solo-button{display:flex;align-items:center;justify-content:center;width:100%;min-height:42px;margin:0;padding:0 12px;background:transparent;border:0;color:#8a6436;font-weight:800;line-height:1.2;text-align:center;text-decoration:underline;white-space:nowrap}
+.play-button + .solo-button{margin-top:10px}
+.solo-button + .solo-button{margin-top:5px}
 .room-error{color:#a33b32;font-size:13px;font-weight:700}
 .ready-list{list-style:none;margin:12px 0 0;padding:0;display:grid;gap:6px}
 .ready-list li{display:flex;align-items:center;gap:8px;background:#fff6e4;border-radius:10px;padding:6px 8px;font-weight:800;color:#5c4328}
@@ -126,3 +128,32 @@ html,body{background:#a3ce57 url('/assets/battlefield.png') center/cover fixed n
 .war-shell .hud-corner button.square-button svg{display:block;margin:0;width:17px;height:17px;flex:none}
 .war-shell .battle-card>.battle-top{display:none}
 .hud-corner .settings-popover{top:46px;right:0}
+
+.decree-overlay{position:absolute;inset:0;z-index:195;display:flex;align-items:center;justify-content:center;padding:max(12px,env(safe-area-inset-top)) 12px max(12px,env(safe-area-inset-bottom));background:#1f3018c9;pointer-events:auto}
+.decree-overlay-card{width:min(920px,100%);max-height:min(88dvh,100%);overflow:auto;padding:16px 18px;border:3px solid #ffe4ac;border-bottom:6px solid #8d6032;border-radius:20px;background:#fff3d5f2;color:#5c4328;box-shadow:0 12px 32px #1c331050}
+.decree-overlay-head{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;margin-bottom:10px}
+.decree-overlay-head h2{margin:0;font-size:clamp(17px,3.5vw,22px);color:#6b442b;flex:1}
+.decree-overlay-timer{margin-left:auto;font-weight:900;font-size:15px;padding:6px 10px;border-radius:10px;background:#f7dba2;border:2px solid #e8c07a;color:#6b442b}
+.decree-overlay-timer.urgent{background:#ffb4a8;border-color:#d85a4a;color:#6b1f14;animation:decree-pulse .8s ease-in-out infinite alternate}
+@keyframes decree-pulse{from{transform:scale(1)}to{transform:scale(1.04)}}
+.decree-overlay-lead{margin:0 0 12px;font-size:13px;line-height:1.45;color:#7a5a38}
+.decree-candidates--overlay{display:flex;flex-direction:column;gap:10px;width:100%}
+.decree-candidates--overlay .decree-candidate{width:100%;box-sizing:border-box}
+.decree-candidate{display:flex;flex-direction:column;align-items:flex-start;gap:4px;text-align:left;padding:12px 13px;min-height:42px;border:2px solid #e8c98a;border-bottom:4px solid #a67a45;border-radius:14px;background:#fff8e8;color:#5c4328;font:inherit;cursor:pointer}
+.decree-candidate:disabled{opacity:.45;cursor:not-allowed}
+.decree-candidate b{font-size:14px;color:#6b442b}
+.decree-candidate small{font-size:11px;color:#8a6845;font-style:italic}
+.decree-candidate span{font-size:12px;font-weight:800;color:#3f6b2f}
+.decree-candidate em{font-size:11px;color:#7a5a38;font-style:normal;line-height:1.35}
+.decree-candidate--custom{background:#f7e6c8;border-color:#dca957}
+.decree-overlay-custom label{display:block;margin:8px 0 6px;font-size:13px;font-weight:700}
+.decree-overlay-custom .wish-input{display:flex;gap:8px;flex-wrap:wrap}
+.decree-overlay-custom textarea{flex:1;min-width:180px;min-height:72px;padding:10px;border:2px solid #e8c98a;border-radius:12px;background:#fffdf6;font:inherit;resize:vertical}
+.decree-overlay-custom button[type=submit]{padding:10px 14px;border:0;border-radius:12px;background:#6b9a4a;color:#fff;font-weight:800;cursor:pointer}
+.decree-back{margin-top:10px;border:0;background:none;color:#6b442b;font-weight:800;font-size:12px;cursor:pointer;padding:4px 0}
+.decree-overlay-foot{margin-top:12px;font-size:11px;color:#7a5a38}
+.decree-overlay-foot .prompt-feedback{margin:6px 0 0;font-size:12px;font-weight:700;color:#6b442b}
+.decree-overlay-status{margin:8px 0 0;font-size:12px;color:#7a5a38}
+.decree-corner-hint{margin:8px 0 0}
+@media(max-width:600px){.decree-overlay-card{padding:12px}.decree-overlay-head h2{font-size:16px}.decree-candidate{padding:10px 12px}}
+.war-shell:has(.game-overlay) .decree-overlay{display:none}

@@ -176,8 +176,7 @@ function releaseSeat(current: Room, seat: Seat, now: number) {
     current.game = {
       ...current.game,
       humans: (current.game.humans ?? []).filter((t) => t !== seat.team),
-      spell:
-        spell && spell.team === seat.team && !spell.patch ? undefined : spell,
+      spell: spell && spell.team === seat.team ? undefined : spell,
     };
   }
   if (!current.seats.length) {

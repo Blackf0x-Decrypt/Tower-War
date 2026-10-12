@@ -1,10 +1,33 @@
-import { validDebuff, type Debuff } from './magic';
 import {
+  activeChaosFog,
+  chaosBoomerangLegions,
+  chaosCaptureMult,
+  chaosCannonMult,
+  chaosDispatchMult,
+  chaosEconomySwap,
+  chaosEnemyFortify,
+  chaosGarrisonVampPercent,
+  chaosGrowthMult,
+  chaosHiveMind,
+  chaosHqSiegeAllowed,
+  chaosIncomeTeamMult,
+  chaosReverseMarch,
+  chaosSendBlocked,
+  chaosSpeedMult,
+  enemyTeamsOf,
+  isChaosKind,
+  pruneChaosRules,
+  type ChaosRule,
+} from './chaos-rules';
+import {
+  chaosEffectLabel,
   localDecreeCandidates,
-  validDecree,
+  validPlayerDecree,
+  type Action,
   type Decree,
   type Target,
 } from './decrees';
+import { validDebuff, type Debuff } from './magic';
 export type Team = 'you' | 'red' | 'purple' | 'green';
 export type Kind =
   | 'tower'
@@ -148,6 +171,7 @@ export type Game = {
   frozen?: Partial<Record<Team, number>>;
   shielded?: Partial<Record<Team, number>>;
   decreeLog: { team: Team; text: string; at: number }[];
+  chaosRules?: ChaosRule[];
 };
 export const TEAMS = {
   you: { name: 'Синий', color: '#4295ff' },
@@ -333,21 +357,24 @@ export function upgradeCannon(g: Game, id: number, actor: Team = 'you'): Game {
 }
 export function teamIncome(g: Game, team: Team) {
   if ((g.frozen?.[team] ?? 0) > g.age) return { gold: 0, resources: 0 };
+  const swap = chaosEconomySwap(g.chaosRules, g.age, team);
+  const monopoly = chaosIncomeTeamMult(g.chaosRules, g.age, team);
   return g.towers
     .filter((t) => t.team === team)
     .reduce(
-      (sum, t) => ({
-        gold:
-          sum.gold +
-          income(t).gold *
-            modifier(g, team, 'income') *
-            (g.event?.kind === 'deposit' && g.event.target === t.id ? 3 : 1),
-        resources:
-          sum.resources +
-          income(t).resources *
-            modifier(g, team, 'income') *
-            (g.event?.kind === 'deposit' && g.event.target === t.id ? 3 : 1),
-      }),
+      (sum, t) => {
+        const base = income(t);
+        const goldPart = swap ? base.resources : base.gold;
+        const resPart = swap ? base.gold : base.resources;
+        const mult =
+          modifier(g, team, 'income') *
+          monopoly *
+          (g.event?.kind === 'deposit' && g.event.target === t.id ? 3 : 1);
+        return {
+          gold: sum.gold + goldPart * mult,
+          resources: sum.resources + resPart * mult,
+        };
+      },
       { gold: 0, resources: 0 },
     );
 }
@@ -368,14 +395,18 @@ export function dispatch(
     source.ruinedAt !== undefined ||
     from === to ||
     g.result ||
-    (g.frozen?.[source.team] ?? 0) > g.age
+    (g.frozen?.[source.team] ?? 0) > g.age ||
+    chaosSendBlocked(g.chaosRules, g.age, source.team)
   )
     return g;
+  const wave = chaosDispatchMult(g.chaosRules, g.age, source.team);
+  const sendFraction = Math.min(
+    1,
+    Math.max(0, fraction) * wave * debuffDispatchFactor(g, source.team),
+  );
   const amount = cargo
     ? 1
-    : Math.floor(
-        Math.min(limit, source.count * Math.min(1, Math.max(0, fraction))),
-      );
+    : Math.floor(Math.min(limit, source.count * sendFraction));
   if (amount < 1) return g;
   const team = source.team,
     visualCount = Math.min(amount, 24);
@@ -679,6 +710,14 @@ export function modifier(
       1,
     );
 }
+
+function debuffDispatchFactor(g: Game, team: Team) {
+  return modifier(g, team, 'dispatch');
+}
+
+function debuffCaptureFactor(g: Game, team: Team) {
+  return modifier(g, team, 'capture');
+}
 export function messageOpportunity(g: Game, team: Team = 'you') {
   const cycle = Math.floor((g.age - 45) / 80);
   const sent = g.messageSentAt?.[team];
@@ -728,6 +767,7 @@ export function startSpell(
     g.result ||
     g.spell ||
     g.age < DEVELOPMENT_SECONDS ||
+    g.age >= g.leaderSince + DECREE_RESPONSE_SECONDS ||
     !actingLeader(g, team)
   )
     return g;
@@ -759,7 +799,7 @@ export function readySpell(
     g.spell.epoch !== epoch ||
     g.authorityEpoch !== epoch ||
     !actingLeader(g, g.spell.team) ||
-    !validDecree(patch) ||
+    !validPlayerDecree(patch) ||
     (debuff !== null && !validDebuff(debuff))
   )
     return g;
@@ -851,11 +891,6 @@ export function economicLeader(g: Game): Team | null {
 export function leader(g: Game): Team | null {
   return g.age < DEVELOPMENT_SECONDS ? null : economicLeader(g);
 }
-function tiedForLead(g: Game, team: Team) {
-  const ranked = earnedRank(g);
-  const row = ranked.find((item) => item.team === team);
-  return !!row && row.n === ranked[0].n;
-}
 function actingLeader(g: Game, team: Team) {
   return g.authority === team || leader(g) === team;
 }
@@ -913,13 +948,6 @@ function addGarrison(t: Tower, amount: number) {
 export function refreshAuthority(g: Game): Game {
   const next = leader(g);
   if (next === g.authority) return g;
-  if (
-    next === null &&
-    g.authority &&
-    g.age >= DEVELOPMENT_SECONDS &&
-    tiedForLead(g, g.authority)
-  )
-    return g;
   return {
     ...g,
     authority: next,
@@ -949,6 +977,7 @@ export function tick(previous: Game, dt = 0.05): Game {
     curses: (previous.curses ?? []).filter((c) =>
       c.debuff.effects.some((e) => c.at + e.duration > previous.age),
     ),
+    chaosRules: pruneChaosRules(previous.chaosRules, previous.age + dt),
     towers: previous.towers.map((t) => ({ ...t })),
     wallets: record((team) => ({ ...previous.wallets[team] })),
     troops: [],
@@ -958,10 +987,20 @@ export function tick(previous: Game, dt = 0.05): Game {
       .map((a) => ({ ...a })),
   };
   const modCache: Record<
-    'income' | 'growth' | 'speed' | 'cannons',
+    'income' | 'growth' | 'speed' | 'cannons' | 'capture' | 'dispatch',
     Partial<Record<Team, number>>
-  > = { income: {}, growth: {}, speed: {}, cannons: {} };
-  const mod = (team: Team, stat: 'income' | 'growth' | 'speed' | 'cannons') => {
+  > = {
+    income: {},
+    growth: {},
+    speed: {},
+    cannons: {},
+    capture: {},
+    dispatch: {},
+  };
+  const mod = (
+    team: Team,
+    stat: 'income' | 'growth' | 'speed' | 'cannons' | 'capture' | 'dispatch',
+  ) => {
     const hit = modCache[stat][team];
     if (hit !== undefined) return hit;
     const value = modifier(g, team, stat);
@@ -989,23 +1028,30 @@ export function tick(previous: Game, dt = 0.05): Game {
     if (!t.team || (g.frozen?.[t.team] ?? 0) > g.age) continue;
     const w = g.wallets[t.team],
       earn = income(t);
+    const swapEco = chaosEconomySwap(g.chaosRules, g.age, t.team);
+    const earnGold = swapEco ? earn.resources : earn.gold;
+    const earnRes = swapEco ? earn.gold : earn.resources;
     const efficiency =
       mod(t.team, 'income') *
+      chaosIncomeTeamMult(g.chaosRules, g.age, t.team) *
       (g.event?.kind === 'deposit' &&
       g.event.target === t.id &&
       g.event.until > g.age
         ? 3
         : 1);
     if (t.home) {
-      w.gold += earn.gold * dt * efficiency;
-      w.resources += earn.resources * dt * efficiency;
-      w.earned += (earn.gold + earn.resources) * dt * efficiency;
+      w.gold += earnGold * dt * efficiency;
+      w.resources += earnRes * dt * efficiency;
+      w.earned += (earnGold + earnRes) * dt * efficiency;
     } else {
-      t.stockGold = (t.stockGold ?? 0) + earn.gold * dt * efficiency;
-      t.stockWood = (t.stockWood ?? 0) + earn.resources * dt * efficiency;
+      t.stockGold = (t.stockGold ?? 0) + earnGold * dt * efficiency;
+      t.stockWood = (t.stockWood ?? 0) + earnRes * dt * efficiency;
     }
     const rate =
-      production(t) * g.growth[t.team] * mod(t.team, 'growth');
+      production(t) *
+      g.growth[t.team] *
+      mod(t.team, 'growth') *
+      chaosGrowthMult(g.chaosRules, g.age, t.team);
     if (t.count < capacity(t))
       t.count = Math.min(capacity(t), t.count + rate * dt);
   }
@@ -1126,8 +1172,11 @@ export function tick(previous: Game, dt = 0.05): Game {
         ? desiredAim
         : t.aim + Math.max(-270 * dt, Math.min(270 * dt, turn));
     if ((t.shotAt ?? 0) > g.age || Math.abs(turn) > 270 * dt + 5) continue;
+    const cannonBoost = chaosCannonMult(g.chaosRules, g.age, t.team);
     t.shotAt =
-      g.age + gun.interval / Math.max(0.05, mod(t.team, 'cannons'));
+      g.age +
+      gun.interval /
+        Math.max(0.05, mod(t.team, 'cannons') * cannonBoost);
     const angle = (t.aim * Math.PI) / 180;
     const sx = t.x + ((Math.cos(angle) * 58) / WORLD_WIDTH) * 100,
       sy =
@@ -1144,7 +1193,7 @@ export function tick(previous: Game, dt = 0.05): Game {
       sx,
       sy,
       target: target.id,
-      damage: gun.damage,
+      damage: gun.damage * cannonBoost,
       duration: Math.max(0.25, bestD / 500),
     });
   }
@@ -1177,7 +1226,8 @@ export function tick(previous: Game, dt = 0.05): Game {
             MOVE_SPEED *
             1.8 *
             g.speed[p.team] *
-            mod(p.team, 'speed')) /
+            mod(p.team, 'speed') *
+            chaosSpeedMult(g.chaosRules, g.age, p.team)) /
             Math.max(1, d),
       );
       p.x = p.sx + (dest.x - p.sx) * p.progress;
@@ -1246,9 +1296,13 @@ export function tick(previous: Game, dt = 0.05): Game {
     const pace = p.haul
       ? MOVE_SPEED * ((WORLD_WIDTH + WORLD_HEIGHT) / 200)
       : MOVE_SPEED;
-    p.progress +=
-      (dt * pace * boost * g.speed[p.team] * mod(p.team, 'speed')) /
+    const marchDelta =
+      (dt * pace * boost * g.speed[p.team] * mod(p.team, 'speed') *
+        chaosSpeedMult(g.chaosRules, g.age, p.team)) /
       Math.max(1, span);
+    if (chaosReverseMarch(g.chaosRules, g.age, p.team))
+      p.progress = Math.max(0, p.progress - marchDelta);
+    else p.progress += marchDelta;
     p.x = p.sx + (target.x - p.sx) * Math.min(1, p.progress);
     p.y = p.sy + (target.y - p.sy) * Math.min(1, p.progress);
     if (p.progress < 1) {
@@ -1266,13 +1320,55 @@ export function tick(previous: Game, dt = 0.05): Game {
     }
     if (target.team === p.team) addGarrison(target, p.strength);
     else if (target.team && (g.shielded?.[target.team] ?? 0) > g.age) {
-    } else if (target.home && !g.allowHeadquartersCapture)
-      target.count = Math.max(0, target.count - p.strength * (p.elite ? 2 : 1));
-    else {
+    } else if (
+      chaosEnemyFortify(
+        g.chaosRules,
+        g.age,
+        target.team,
+        p.team,
+      )
+    ) {
+      const heal =
+        (p.strength *
+          (p.elite ? 2 : 1) *
+          chaosCaptureMult(g.chaosRules, g.age, p.team)) /
+        2;
+      target.count = Math.min(capacity(target), target.count + heal);
+    } else if (
+      target.home &&
+      !g.allowHeadquartersCapture &&
+      !chaosHqSiegeAllowed(g.chaosRules, g.age)
+    ) {
+      target.count = Math.max(
+        0,
+        target.count -
+          p.strength *
+            (p.elite ? 2 : 1) *
+            chaosCaptureMult(g.chaosRules, g.age, p.team) *
+            debuffCaptureFactor(g, p.team),
+      );
+      if (
+        target.count > 0 &&
+        chaosBoomerangLegions(g.chaosRules, g.age, p.team)
+      ) {
+        const source = byId[p.from];
+        if (source?.team === p.team) addGarrison(source, p.strength);
+      }
+    } else {
       target.count -=
-        (p.strength * (p.elite ? 2 : 1)) /
+        (p.strength *
+          (p.elite ? 2 : 1) *
+          chaosCaptureMult(g.chaosRules, g.age, p.team) *
+          debuffCaptureFactor(g, p.team)) /
         ((1 + (target.level - 1) * 0.12) *
           (target.specialty === 'fortress' ? 1.5 : 1));
+      if (
+        target.count >= 0 &&
+        chaosBoomerangLegions(g.chaosRules, g.age, p.team)
+      ) {
+        const source = byId[p.from];
+        if (source?.team === p.team) addGarrison(source, p.strength);
+      }
       if (target.count < 0) {
         const previousTeam = target.team;
         const wasHome = !!target.home;
@@ -1306,7 +1402,48 @@ export function tick(previous: Game, dt = 0.05): Game {
           g.captures++;
           g.notice = `${target.name} захвачен. ${target.kind === 'gold' ? 'Шахта приносит золото.' : target.kind === 'lumber' ? 'Лесопилка приносит древесину.' : target.kind === 'barracks' ? 'Казарма набирает бойцов.' : 'Настройте улучшения и автомаршрут.'}`;
         }
+        const vamp = chaosGarrisonVampPercent(g.chaosRules, g.age, p.team);
+        if (vamp > 0) {
+          let stolen = 0;
+          for (const bt of g.towers) {
+            if (
+              !bt.team ||
+              bt.team === p.team ||
+              bt.ruinedAt !== undefined ||
+              bt.home
+            )
+              continue;
+            const bite = Math.floor(bt.count * vamp);
+            if (bite < 1) continue;
+            bt.count -= bite;
+            stolen += bite;
+            addGarrison(target, bite);
+          }
+          if (stolen > 0 && humanTeams(g).includes(p.team))
+            g.notice = `Кровопийца: +${stolen} с чужих гарнизонов.`;
+        }
       }
+    }
+  }
+  const fog = activeChaosFog(g.chaosRules, g.age);
+  if (fog && Math.floor(g.age * 2) !== Math.floor((g.age - dt) * 2)) {
+    const flickers = Math.max(1, Math.min(8, Math.floor(fog.param / 8)));
+    for (let f = 0; f < flickers; f++) {
+      const neutrals = g.towers.filter(
+        (t) => !t.team && t.ruinedAt === undefined && !t.home,
+      );
+      if (!neutrals.length) break;
+      const pick =
+        neutrals[
+          Math.abs(stableDecreeHash(fog.caster.length, g.age * 100 + f)) %
+            neutrals.length
+        ];
+      const teams: (Team | null)[] = [null, fog.caster, ...enemyTeamsOf(fog.caster)];
+      pick.team =
+        teams[
+          Math.abs(stableDecreeHash(pick.id, g.age + f)) % teams.length
+        ] ?? null;
+      if (pick.team) pick.count = Math.max(pick.count, 8 + (fog.param % 12));
     }
   }
   for (const route of g.automation) {
@@ -1346,6 +1483,31 @@ export function tick(previous: Game, dt = 0.05): Game {
         false,
         Math.min(groupSize(source), source.count - reserve, need),
       );
+  }
+  if (chaosHiveMind(g.chaosRules, g.age, 'you') || chaosHiveMind(g.chaosRules, g.age, 'red') || chaosHiveMind(g.chaosRules, g.age, 'purple') || chaosHiveMind(g.chaosRules, g.age, 'green')) {
+    for (const team of TEAM_IDS) {
+      if (!chaosHiveMind(g.chaosRules, g.age, team)) continue;
+      if ((g.frozen?.[team] ?? 0) > g.age) continue;
+      for (const src of g.towers) {
+        if (src.team !== team || src.ruinedAt !== undefined || src.count < 4)
+          continue;
+        if (g.automation.some((a) => a.from === src.id && a.team === team))
+          continue;
+        let best: Tower | undefined;
+        let bestD = Infinity;
+        for (const cand of g.towers) {
+          if (cand.id === src.id || cand.ruinedAt !== undefined) continue;
+          if (cand.team === team) continue;
+          const d = Math.hypot(cand.x - src.x, cand.y - src.y);
+          if (d < bestD) {
+            bestD = d;
+            best = cand;
+          }
+        }
+        if (best && src.count > 6)
+          g = dispatch(g, src.id, best.id, 0.55, false, groupSize(src));
+      }
+    }
   }
   for (const t of g.towers) {
     if (
@@ -1550,6 +1712,128 @@ function matches(t: Tower, target: Target, actor: Team): boolean {
   if (target === 'main') return t.team === actor && !!t.home;
   return t.team === (target === 'all' ? actor : target);
 }
+
+function applyChaosInstant(next: Game, caster: Team, a: Action): string | null {
+  const param = a.param ?? 0;
+  if (a.kind === 'chaos_neutral_uprising') {
+    let touched = 0;
+    for (const t of next.towers) {
+      if (t.team || t.ruinedAt !== undefined) continue;
+      t.count = Math.min(capacity(t), t.count + param);
+      const roll = Math.abs(stableDecreeHash(t.id, caster + param)) % 3;
+      if (roll !== 0) {
+        t.team = caster;
+        touched++;
+      }
+    }
+    return `Нейтралы поднялись (+${param}), захвачено точек: ${touched}`;
+  }
+  if (a.kind === 'chaos_neutral_ripple') {
+    const hq = next.towers.find(
+      (t) => t.home === caster && t.ruinedAt === undefined,
+    );
+    if (!hq) return 'Волна нейтралов: штаб не найден';
+    const radius = Math.max(8, param);
+    let taken = 0;
+    for (const t of next.towers) {
+      if (t.team || t.ruinedAt !== undefined || t.home) continue;
+      const d = Math.hypot(t.x - hq.x, t.y - hq.y);
+      if (d > radius) continue;
+      t.team = caster;
+      t.count = Math.max(t.count, 12 + (param % 10));
+      taken++;
+    }
+    return `Волна от штаба: ${taken} нейтралов стали вашими`;
+  }
+  if (a.kind === 'chaos_land_flip') {
+    const victim = enemyTeamsOf(caster).reduce<Team>((best, t) => {
+      const count = next.towers.filter(
+        (x) => x.team === t && !x.home && x.ruinedAt === undefined,
+      ).length;
+      const bestCount = next.towers.filter(
+        (x) => x.team === best && !x.home && x.ruinedAt === undefined,
+      ).length;
+      return count > bestCount ? t : best;
+    }, enemyTeamsOf(caster)[0]);
+    let swaps = 0;
+    for (const t of next.towers) {
+      if (t.home || t.ruinedAt !== undefined) continue;
+      if (t.team === caster) {
+        t.team = victim;
+        swaps++;
+      } else if (t.team === victim) {
+        t.team = caster;
+        swaps++;
+      }
+    }
+    return `Перекраска: ${swaps} зданий поменялись с ${victim}`;
+  }
+  if (a.kind === 'chaos_mine_birth') {
+    const mines = next.towers.filter(
+      (t) =>
+        t.team === caster &&
+        t.ruinedAt === undefined &&
+        ['gold', 'lumber', 'barracks'].includes(t.kind),
+    );
+    let left = param;
+    for (const t of mines) {
+      if (left <= 0) break;
+      const chunk = Math.max(1, Math.floor(param / Math.max(1, mines.length)));
+      addGarrison(t, Math.min(left, chunk));
+      left -= chunk;
+    }
+    return `Шахты и казармы выплюнули ${param} бойцов`;
+  }
+  if (a.kind === 'chaos_building_shuffle') {
+    const mobile = next.towers.filter((t) => !t.home && t.ruinedAt === undefined);
+    const coords = mobile.map((t) => ({ x: t.x, y: t.y }));
+    for (let i = coords.length - 1; i > 0; i--) {
+      const j = Math.abs(stableDecreeHash(i, param + caster.length)) % (i + 1);
+      [coords[i], coords[j]] = [coords[j], coords[i]];
+    }
+    mobile.forEach((t, i) => {
+      t.x = coords[i].x;
+      t.y = coords[i].y;
+    });
+    return `Переставлено зданий: ${mobile.length}`;
+  }
+  if (a.kind === 'chaos_garrison_tremor') {
+    const factor = Math.max(0.08, Math.min(0.82, param / 100));
+    let drained = 0;
+    for (const t of next.towers) {
+      if (!t.team || t.team === caster || t.ruinedAt !== undefined) continue;
+      const drop = Math.floor(t.count * factor);
+      t.count = Math.max(0, t.count - drop);
+      drained += drop;
+    }
+    return `У врагов вытряхнули ${drained} бойцов`;
+  }
+  return null;
+}
+
+function stableDecreeHash(a: number, b: number) {
+  return Math.imul(a ^ b, 2654435761) | 0;
+}
+
+function registerChaosRule(next: Game, caster: Team, a: Action): Game {
+  if (!isChaosKind(a.kind)) return next;
+  if (a.kind === 'chaos_hq_shield') {
+    const until = next.age + a.amount;
+    next.shielded = { ...(next.shielded ?? {}), [caster]: until };
+    return next;
+  }
+  if (a.amount <= 0) return next;
+  const rule: ChaosRule = {
+    kind: a.kind,
+    caster,
+    until: next.age + a.amount,
+    param: a.param ?? 0,
+  };
+  next.chaosRules = [...(next.chaosRules ?? []), rule];
+  if (a.kind === 'chaos_hq_siege') next.allowHeadquartersCapture = true;
+  return next;
+}
+
 export function applyDecree(
   g: Game,
   team: Team,
@@ -1560,7 +1844,7 @@ export function applyDecree(
     return { ...g, notice: 'Право промпта откроется после 4 минут развития.' };
   if (
     g.result ||
-    !validDecree(p) ||
+    !validPlayerDecree(p) ||
     !actingLeader(g, team) ||
     g.authorityEpoch !== epoch
   )
@@ -1578,11 +1862,19 @@ export function applyDecree(
     speed: { ...g.speed },
     frozen: { ...g.frozen },
     shielded: { ...g.shielded },
+    chaosRules: [...(g.chaosRules ?? [])],
     wallets: record((t) => ({ ...g.wallets[t] })),
     automation: g.automation.map((a) => ({ ...a })),
   };
   const log: string[] = [];
   for (const a of actions) {
+    if (isChaosKind(a.kind)) {
+      const instant = applyChaosInstant(next, team, a);
+      if (instant) log.push(instant);
+      else log.push(chaosEffectLabel(a));
+      registerChaosRule(next, team, a);
+      continue;
+    }
     const targets = next.towers.filter((t) => matches(t, a.target, team));
     const affected = (Object.keys(TEAMS) as Team[]).filter(
       (t) =>
