@@ -1,3 +1,11 @@
+import type { ChaosEffectKind } from './chaos-rules';
+import {
+  bootstrapMatch,
+  stableRoomSeed,
+  unionChaosBans,
+  validChaosBanList,
+  weeklyMutator,
+} from './match-meta';
 import { applyPlay, type PlayAction } from './play';
 import { diffTowers, diffTroops, type TroopJournal } from './room-protocol';
 import { initialGame, tick, TEAM_IDS, type Game, type Team } from './tower-game';
@@ -29,6 +37,8 @@ export type Room = {
   startAt: number | null;
   revision: number;
   troopJournal?: TroopJournal;
+  matchSeed?: number;
+  chaosBans?: Partial<Record<Team, ChaosEffectKind[]>>;
 };
 
 export const SEAT_AWAY_MS = 20_000;
@@ -51,6 +61,8 @@ export type RoomView = {
   clock?: number;
   revision?: number;
   troopJournal?: TroopJournal;
+  chaosBans?: Partial<Record<Team, ChaosEffectKind[]>>;
+  mutatorBanner?: string;
 };
 
 export function blankRoom(now = Date.now()): Room {
@@ -88,6 +100,8 @@ export function roomToJson(room: Room): string {
   if (game.curses && game.curses.length > 12) game.curses = game.curses.slice(-12);
   if (game.decreeLog && game.decreeLog.length > 8)
     game.decreeLog = game.decreeLog.slice(-8);
+  if (game.decreeChronicle && game.decreeChronicle.length > 5)
+    game.decreeChronicle = game.decreeChronicle.slice(0, 5);
   return capJson(JSON.stringify({ ...room, game }), capStored);
 }
 
@@ -147,7 +161,7 @@ function syncReady(current: Room) {
   const allReady =
     current.seats.length >= 2 && current.seats.every((s) => s.ready);
   if (allReady) {
-    if (!current.startAt) current.startAt = Date.now() + 3000;
+    if (!current.startAt) current.startAt = Date.now() + 33_000;
     return;
   }
   current.startAt = null;
@@ -155,7 +169,16 @@ function syncReady(current: Room) {
 
 function launch(current: Room, now: number) {
   if (current.started || !current.startAt || now < current.startAt) return;
-  current.game = stampHumans(initialGame(), current.seats);
+  const seed =
+    current.matchSeed ??
+    stableRoomSeed(current.seats.map((s) => s.id).sort());
+  current.matchSeed = seed;
+  const humans = current.seats.map((s) => s.team);
+  const banned = unionChaosBans(current.chaosBans, humans);
+  const mutator = weeklyMutator(now);
+  let game = stampHumans(initialGame(), current.seats);
+  game = bootstrapMatch(game, seed, banned, mutator);
+  current.game = game;
   current.started = true;
   current.paused = false;
   current.clock = now;
@@ -226,6 +249,8 @@ function viewOf(current: Room, playerId: string | null, now = Date.now()): RoomV
     clock: current.clock,
     revision: current.revision,
     troopJournal: current.troopJournal,
+    chaosBans: current.chaosBans,
+    mutatorBanner: weeklyMutator(now).label,
   };
 }
 
@@ -315,6 +340,7 @@ export async function roomCommand(body: {
   name?: string;
   action?: PlayAction;
   paused?: boolean;
+  kinds?: unknown;
 }): Promise<RoomView> {
   const kv = resolveKv();
   if (kv === 'missing') return missingRoom();
@@ -373,6 +399,25 @@ export async function roomCommand(body: {
       syncReady(current);
       return viewOf(current, seat.id);
     }
+    if (op === 'chaos-ban') {
+      if (current.started)
+        return { error: 'Бан хаоса только до старта матча.', ...viewOf(current, seat.id) };
+      if (!current.startAt || now >= current.startAt - 3000)
+        return {
+          error: 'Окно бана закрыто (последние 3 с перед стартом).',
+          ...viewOf(current, seat.id),
+        };
+      if (!validChaosBanList(body.kinds))
+        return {
+          error: 'Выберите до двух разных типов хаоса.',
+          ...viewOf(current, seat.id),
+        };
+      current.chaosBans = {
+        ...(current.chaosBans ?? {}),
+        [seat.team]: body.kinds as ChaosEffectKind[],
+      };
+      return viewOf(current, seat.id);
+    }
     if (op === 'pause') {
       if (
         current.started &&
@@ -390,6 +435,8 @@ export async function roomCommand(body: {
       current.game = initialGame();
       current.clock = now;
       current.startAt = null;
+      current.chaosBans = {};
+      current.matchSeed = undefined;
       for (const s of current.seats) s.ready = false;
       return viewOf(current, seat.id);
     }

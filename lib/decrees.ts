@@ -747,19 +747,37 @@ function buildCandidate(
   };
 }
 
-export function localDecreeCandidates(prompt: string): DecreeCandidate[] {
+function templateBanned(t: ChaosTemplate, banned: Set<ChaosEffectKind>): boolean {
+  return banned.has(t.kind);
+}
+
+export function localDecreeCandidates(
+  prompt: string,
+  bannedKinds?: Iterable<ChaosEffectKind>,
+): DecreeCandidate[] {
+  const banned = new Set(bannedKinds ?? []);
   const base = stableSeed(prompt, 17);
   const used = new Set<number>();
   const mains: ChaosTemplate[] = [];
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; mains.length < 3 && i < CHAOS_TEMPLATES.length * 2; i++) {
     let idx = Math.abs(base + i * 9973) % CHAOS_TEMPLATES.length;
     while (used.has(idx)) idx = (idx + 1) % CHAOS_TEMPLATES.length;
     used.add(idx);
-    mains.push(CHAOS_TEMPLATES[idx]);
+    const t = CHAOS_TEMPLATES[idx]!;
+    if (templateBanned(t, banned)) continue;
+    mains.push(t);
+  }
+  for (let j = 0; mains.length < 3 && j < CHAOS_TEMPLATES.length; j++) {
+    const t = CHAOS_TEMPLATES[j]!;
+    if (!templateBanned(t, banned)) mains.push(t);
   }
   return mains.map((main, index) => {
-    const side =
-      SIDE_CHAOS[Math.abs(base + index * 31) % SIDE_CHAOS.length];
+    let side =
+      SIDE_CHAOS[Math.abs(base + index * 31) % SIDE_CHAOS.length]!;
+    let guard = 0;
+    while (templateBanned(side, banned) && guard++ < SIDE_CHAOS.length) {
+      side = SIDE_CHAOS[(Math.abs(base + index * 31) + guard) % SIDE_CHAOS.length]!;
+    }
     return buildCandidate(main, side, `local-${index}`, base + index);
   });
 }

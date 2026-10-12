@@ -1,4 +1,5 @@
 import { env } from 'cloudflare:workers';
+import { isChaosKind, type ChaosEffectKind } from '@/lib/chaos-rules';
 import {
   CHAOS_SCHEMA_DOC,
   localCustomCandidate,
@@ -77,6 +78,7 @@ export async function POST(request: Request) {
     prompt?: string;
     context?: string;
     custom?: boolean;
+    banned?: string[];
   };
   try {
     body = JSON.parse(raw);
@@ -138,10 +140,13 @@ export async function POST(request: Request) {
     );
 
   const prompt = decreePromptForCandidates(body.prompt, body.context);
+  const banned: ChaosEffectKind[] = Array.isArray(body.banned)
+    ? body.banned.filter((k): k is ChaosEffectKind => isChaosKind(k))
+    : [];
   const { key, model } = settings();
   if (!key) {
     return Response.json({
-      candidates: localDecreeCandidates(prompt),
+      candidates: localDecreeCandidates(prompt, banned),
       provider: 'local',
     });
   }
@@ -173,12 +178,12 @@ export async function POST(request: Request) {
         candidates: result.candidates,
       });
     return Response.json({
-      candidates: localDecreeCandidates(prompt),
+      candidates: localDecreeCandidates(prompt, banned),
       provider: 'local',
     });
   } catch {
     return Response.json({
-      candidates: localDecreeCandidates(prompt),
+      candidates: localDecreeCandidates(prompt, banned),
       provider: 'local',
     });
   }

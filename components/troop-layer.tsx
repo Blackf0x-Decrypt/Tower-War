@@ -222,7 +222,44 @@ export const TroopLayer = memo(function TroopLayer({camera, viewport, speech, pa
                 ctx.save();ctx.translate(0,-18);
                 const face = p.waypoint?.x ?? towerAt(towers,p.to)?.x;
                 if (face !== undefined && face < p.sx) ctx.scale(-1, 1);
-                ctx.drawImage(sprites[p.team],-19,-24,38,48);ctx.restore();
+                const v = p.variant ?? 'line';
+                if (v === 'heavy') {
+                  ctx.fillStyle = TEAMS[p.team].color;
+                  ctx.strokeStyle = '#2a2018';
+                  ctx.lineWidth = 1.2;
+                  ctx.beginPath();
+                  ctx.roundRect(-14, -28, 28, 34, 4);
+                  ctx.fill();
+                  ctx.stroke();
+                  ctx.fillStyle = '#f4e8c8';
+                  ctx.beginPath();
+                  ctx.arc(0, -22, 6, 0, Math.PI * 2);
+                  ctx.fill();
+                } else if (v === 'scout') {
+                  ctx.strokeStyle = TEAMS[p.team].color;
+                  ctx.lineWidth = 2.2;
+                  ctx.beginPath();
+                  ctx.moveTo(0, -30);
+                  ctx.lineTo(8, -8);
+                  ctx.lineTo(0, -14);
+                  ctx.lineTo(-8, -8);
+                  ctx.closePath();
+                  ctx.stroke();
+                  ctx.fillStyle = TEAMS[p.team].color;
+                  ctx.beginPath();
+                  ctx.arc(0, -18, 4, 0, Math.PI * 2);
+                  ctx.fill();
+                } else if (v === 'skirm') {
+                  ctx.fillStyle = TEAMS[p.team].color;
+                  for (let k = -1; k <= 1; k++) {
+                    ctx.beginPath();
+                    ctx.ellipse(k * 7, -16, 4, 9, k * 0.25, 0, Math.PI * 2);
+                    ctx.fill();
+                  }
+                } else {
+                  ctx.drawImage(sprites[p.team], -19, -24, 38, 48);
+                }
+                ctx.restore();
                 if(p.scoutUntil||p.elite){ctx.fillStyle='#fff1a2';ctx.font='bold 14px Arial';ctx.fillText(p.elite?'★':'◉',-6,-46);}
               }
               if(f.speech&&!f.hideMessages&&p.speech&&p.progress>.07&&p.progress<.8){

@@ -33,6 +33,7 @@ import {
   type Recording,
   type ReplayState,
 } from '@/lib/replays';
+import { CHAOS_EFFECT_KINDS, type ChaosEffectKind } from '@/lib/chaos-rules';
 import {
   gameDecreeContextSeed,
   localDecreeCandidates,
@@ -164,7 +165,10 @@ export default function Home() {
     startAt: number | null;
     game: Game | null;
     you: { team: Team; ready: boolean } | null;
+    chaosBans?: Partial<Record<Team, ChaosEffectKind[]>>;
+    mutatorBanner?: string;
   } | null>(null);
+  const [banDraft, setBanDraft] = useState<ChaosEffectKind[]>([]);
   const [clock, setClock] = useState(0);
   const seatRef = useRef(seat);
   if (seat) seatRef.current = seat;
@@ -557,7 +561,9 @@ export default function Home() {
           earned: game.wallets[leader].earned,
           epoch: game.authorityEpoch,
         });
-        setCandidates(localDecreeCandidates(seed));
+        setCandidates(
+          localDecreeCandidates(seed, game.bannedChaos ?? []),
+        );
         void refreshDecreeCandidates(seed, game.authorityEpoch);
       }
     }
@@ -574,6 +580,26 @@ export default function Home() {
     developing,
     typingDeadline,
   ]);
+  useEffect(() => {
+    if (
+      !started ||
+      game.result ||
+      game.authority !== meRef.current ||
+      !game.spell ||
+      game.spell.patch
+    )
+      return;
+    const epoch = game.authorityEpoch;
+    const seed =
+      gameDecreeContextSeed({
+        elapsed: game.elapsed,
+        towers: game.towers.filter((t) => t.team === game.authority).length,
+        earned: game.wallets[game.authority!].earned,
+        epoch,
+      }) + `#${game.spellCandidateSeed ?? 0}`;
+    setCandidates(localDecreeCandidates(seed, game.bannedChaos ?? []));
+    void refreshDecreeCandidates(seed, epoch);
+  }, [game.spellCandidateSeed, game.spell?.startedAt, started]);
   async function refreshDecreeCandidates(seed: string, epoch: number) {
     const request = new AbortController();
     pending.current?.abort();
@@ -583,7 +609,11 @@ export default function Home() {
       const response = await fetch('/api/decree', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'candidates', context: seed }),
+        body: JSON.stringify({
+          action: 'candidates',
+          context: seed,
+          banned: gameRef.current.bannedChaos ?? [],
+        }),
         signal: request.signal,
       });
       const data = (await response.json()) as {
@@ -644,7 +674,9 @@ export default function Home() {
       earned: game.wallets[leader].earned,
       epoch,
     });
-    setCandidates(localDecreeCandidates(seed));
+    setCandidates(
+      localDecreeCandidates(seed, gameRef.current.bannedChaos ?? []),
+    );
     void refreshDecreeCandidates(seed, epoch);
   }, [
     started,
@@ -1331,6 +1363,60 @@ export default function Home() {
           <button className="solo-button" onClick={begin}>
             Играть одному за синих
           </button>
+          {lobby?.mutatorBanner && (
+            <p className="lobby-mutator">{lobby.mutatorBanner}</p>
+          )}
+          {seat &&
+            lobby?.startAt != null &&
+            (clock || Date.now()) < lobby.startAt - 3000 && (
+              <div className="lobby-chaos-ban">
+                <b>Бан хаоса (до 2 типов, 30 с)</b>
+                <div className="lobby-chaos-ban-grid">
+                  {CHAOS_EFFECT_KINDS.map((kind) => {
+                    const on = banDraft.includes(kind);
+                    return (
+                      <button
+                        key={kind}
+                        type="button"
+                        className={on ? 'on' : ''}
+                        onClick={() => {
+                          setBanDraft((prev) => {
+                            if (prev.includes(kind))
+                              return prev.filter((k) => k !== kind);
+                            if (prev.length >= 2) return prev;
+                            return [...prev, kind];
+                          });
+                        }}
+                      >
+                        {kind.replace(/^chaos_/, '').replaceAll('_', ' ')}
+                      </button>
+                    );
+                  })}
+                </div>
+                <button
+                  type="button"
+                  className="solo-button"
+                  disabled={!banDraft.length}
+                  onClick={() =>
+                    void roomPost({
+                      op: 'chaos-ban',
+                      playerId: seat.id,
+                      kinds: banDraft,
+                    })
+                  }
+                >
+                  Сохранить бан
+                </button>
+                {lobby.chaosBans?.[seat.team]?.length ? (
+                  <small>
+                    Ваш бан:{' '}
+                    {lobby.chaosBans[seat.team]!
+                      .map((k) => k.replace(/^chaos_/, ''))
+                      .join(', ')}
+                  </small>
+                ) : null}
+              </div>
+            )}
           {!!lobby?.seats.length && (
             <ul className="ready-list">
               {lobby.seats.map((s) => (
@@ -1575,12 +1661,44 @@ export default function Home() {
         />
       </button>
 
-      <section className="battle-card">
+      <section
+        className={`battle-card${
+          game.epochBanner?.instant && game.epochBanner.until > game.age
+            ? ' decree-reveal-shake'
+            : ''
+        }`}
+      >
+        {game.epochBanner && game.epochBanner.until > game.age && (
+          <div
+            className={`epoch-banner${
+              game.epochBanner.instant ? ' epoch-banner--instant' : ''
+            }`}
+          >
+            <Crown size={16} />
+            <span>
+              Эпоха {game.epochBanner.epoch} ·{' '}
+              <b style={{ color: TEAMS[game.epochBanner.team].color }}>
+                {playerName(game, game.epochBanner.team)}
+              </b>
+              : {game.epochBanner.title}
+            </span>
+          </div>
+        )}
         <div className="battle-top">
           <div className="objective">
             <Flag size={19} />
-            <b>Захватите долину</b>
-            <span>Больше башен — ближе победа</span>
+            <b>
+              {game.epochObjective && !developing
+                ? game.epochObjective.label
+                : 'Захватите долину'}
+            </b>
+            <span>
+              {game.epochObjective && !developing
+                ? game.epochObjective.done
+                  ? 'Выполнено · бонус лидеру'
+                  : `${Math.floor(game.epochObjective.progress)}/${game.epochObjective.target}`
+                : 'Больше башен — ближе победа'}
+            </span>
           </div>
           <div className="team-score">
             {Object.entries(TEAMS).map(([id, team]) => (
@@ -2334,6 +2452,49 @@ export default function Home() {
           </div>
         </aside>
       )}
+      {(game.decreeChronicle?.length ?? 0) > 0 && (
+        <aside className="decree-chronicle" aria-label="Хроника указов">
+          <b>Хроника</b>
+          <ul>
+            {(game.decreeChronicle ?? []).slice(0, 5).map((row, i) => (
+              <li key={`${row.epoch}-${row.at}-${i}`}>
+                <i style={{ background: TEAMS[row.team].color }} />
+                <span>
+                  э.{row.epoch} · {playerName(game, row.team)} — {row.title}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </aside>
+      )}
+      {game.matchMutator && (
+        <div className="season-mutator-banner">{game.matchMutator.label}</div>
+      )}
+      {game.mapMutation && !developing && (
+        <div className="map-mutation-hint">{game.mapMutation.label}</div>
+      )}
+      {game.spell &&
+        !game.spell.patch &&
+        game.authority &&
+        game.authority !== me &&
+        !game.teamVetoUsed?.[me] &&
+        (game.humans ?? []).includes(me) && (
+          <div className="decree-veto-bar">
+            <span>Вето команды (1 раз за матч)</span>
+            <button
+              type="button"
+              onClick={() => play({ type: 'decree-veto', mode: 'delay' })}
+            >
+              +10 с
+            </button>
+            <button
+              type="button"
+              onClick={() => play({ type: 'decree-veto', mode: 'reroll' })}
+            >
+              Перекинуть карты
+            </button>
+          </div>
+        )}
       {game.announcement && game.announcement.until > game.age && (
         <output
           key={`${game.announcement.team}-${game.announcement.until}`}

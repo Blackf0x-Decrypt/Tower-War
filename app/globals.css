@@ -157,3 +157,21 @@ html,body{background:#a3ce57 url('/assets/battlefield.png') center/cover fixed n
 .decree-corner-hint{margin:8px 0 0}
 @media(max-width:600px){.decree-overlay-card{padding:12px}.decree-overlay-head h2{font-size:16px}.decree-candidate{padding:10px 12px}}
 .war-shell:has(.game-overlay) .decree-overlay{display:none}
+.epoch-banner{position:absolute;top:56px;left:50%;transform:translateX(-50%);z-index:12;display:flex;align-items:center;gap:8px;padding:8px 14px;border-radius:14px;background:#fff8e8cc;border:2px solid #e8c070;box-shadow:0 6px 18px #5a402020;font-size:13px;font-weight:700;color:#5c3d22;max-width:min(92%,520px);text-align:center}
+.epoch-banner--instant{animation:decree-pulse 1.2s ease-in-out 2}
+.decree-reveal-shake .battlefield{animation:decree-shake .45s ease-in-out 2}
+@keyframes decree-pulse{0%,100%{box-shadow:0 6px 18px #5a402020}50%{box-shadow:0 0 0 4px #ffb82c88,0 8px 24px #c45a2040}}
+@keyframes decree-shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-4px)}75%{transform:translateX(4px)}}
+.decree-chronicle{position:absolute;top:118px;left:16px;z-index:11;width:min(240px,42vw);padding:8px 10px;border-radius:12px;background:#fff6e6e6;border:2px solid #e0c080;font-size:11px;color:#5a4028}
+.decree-chronicle ul{margin:6px 0 0;padding:0;list-style:none;display:flex;flex-direction:column;gap:4px}
+.decree-chronicle li{display:flex;gap:6px;align-items:flex-start}
+.decree-chronicle i{width:8px;height:8px;border-radius:50%;flex-shrink:0;margin-top:4px}
+.season-mutator-banner{position:absolute;top:12px;right:12px;z-index:11;padding:5px 10px;border-radius:10px;background:#2a4a2aee;color:#e8ffd0;font-size:10px;font-weight:800}
+.map-mutation-hint{position:absolute;bottom:120px;left:50%;transform:translateX(-50%);z-index:10;padding:6px 12px;border-radius:999px;background:#00000055;color:#fff;font-size:11px}
+.decree-veto-bar{position:absolute;top:200px;right:12px;z-index:13;display:flex;flex-direction:column;gap:6px;padding:8px;background:#fff3d5;border:2px solid #dca957;border-radius:12px;font-size:11px}
+.decree-veto-bar button{padding:6px 8px;border:0;border-radius:8px;background:#6b442b;color:#fff;font-weight:800;cursor:pointer}
+.lobby-mutator{margin:8px 0;font-size:12px;font-weight:700;color:#6b442b}
+.lobby-chaos-ban{margin:12px 0;padding:10px;border:2px dashed #dca957;border-radius:12px;background:#fff8ee}
+.lobby-chaos-ban-grid{display:flex;flex-wrap:wrap;gap:4px;max-height:120px;overflow:auto;margin:8px 0}
+.lobby-chaos-ban-grid button{font-size:9px;padding:4px 6px;border-radius:8px;border:1px solid #d7b978;background:#fff}
+.lobby-chaos-ban-grid button.on{background:#6b9a4a;color:#fff;border-color:#4a7030}

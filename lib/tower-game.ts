@@ -27,7 +27,13 @@ import {
   type Decree,
   type Target,
 } from './decrees';
-import { validDebuff, type Debuff } from './magic';
+import { proceduralDebuff, validDebuff, type Debuff } from './magic';
+import {
+  decreeHasInstantReveal,
+  troopVariantFor,
+  updateEpochObjective,
+  variantSpeedMult,
+} from './match-meta';
 export type Team = 'you' | 'red' | 'purple' | 'green';
 export type Kind =
   | 'tower'
@@ -76,6 +82,7 @@ export type Troop = {
   waypoint?: { x: number; y: number };
   haul?: { gold: number; resources: number };
   stolenAt?: number;
+  variant?: 'line' | 'heavy' | 'scout' | 'skirm';
 };
 export type Route = { from: number; to: number; team: Team; until: number };
 export type Automation = {
@@ -172,6 +179,27 @@ export type Game = {
   shielded?: Partial<Record<Team, number>>;
   decreeLog: { team: Team; text: string; at: number }[];
   chaosRules?: ChaosRule[];
+  decreeChronicle?: {
+    team: Team;
+    title: string;
+    epoch: number;
+    at: number;
+  }[];
+  epochBanner?: {
+    team: Team;
+    title: string;
+    epoch: number;
+    until: number;
+    instant?: boolean;
+  };
+  epochObjective?: import('./match-meta').EpochObjective;
+  mapMutation?: import('./match-meta').MapMutation;
+  matchMutator?: import('./match-meta').MatchMutator;
+  roomSeed?: number;
+  bannedChaos?: import('./chaos-rules').ChaosEffectKind[];
+  teamVetoUsed?: Partial<Record<Team, boolean>>;
+  spellVetoDelay?: number;
+  spellCandidateSeed?: number;
 };
 export const TEAMS = {
   you: { name: 'Синий', color: '#4295ff' },
@@ -440,6 +468,7 @@ export function dispatch(
           : '',
       cargo,
       elite: source.specialty === 'elite',
+      variant: troopVariantFor(team, from, to, i, source.kind),
     }),
   );
   return {
@@ -777,6 +806,8 @@ export function startSpell(
   return {
     ...announcePrompt(seated, team, prompt),
     spellSeq: nonce,
+    spellVetoDelay: 0,
+    spellCandidateSeed: seated.spellCandidateSeed ?? 0,
     spell: {
       team,
       epoch: seated.authorityEpoch,
@@ -787,6 +818,41 @@ export function startSpell(
     },
   };
 }
+function decreeUsesBanned(g: Game, patch: Decree): boolean {
+  const banned = new Set(g.bannedChaos ?? []);
+  if (!banned.size) return false;
+  const actions = patch.kind === 'batch' ? patch.actions : [patch];
+  return actions.some((a) => isChaosKind(a.kind) && banned.has(a.kind));
+}
+
+export function decreeVeto(
+  g: Game,
+  actor: Team,
+  mode: 'delay' | 'reroll',
+): Game {
+  const spell = g.spell;
+  if (!spell || spell.patch || g.result || g.authority === actor) return g;
+  if (g.teamVetoUsed?.[actor]) return g;
+  const human = humanTeams(g);
+  if (!human.includes(actor)) return g;
+  const next: Game = {
+    ...g,
+    teamVetoUsed: { ...(g.teamVetoUsed ?? {}), [actor]: true },
+  };
+  if (mode === 'delay') {
+    return {
+      ...next,
+      spellVetoDelay: (g.spellVetoDelay ?? 0) + 10,
+      notice: `${playerName(g, actor)} наложил вето · +10 с на выбор указа`,
+    };
+  }
+  return {
+    ...next,
+    spellCandidateSeed: (g.spellCandidateSeed ?? 0) + 1,
+    notice: `${playerName(g, actor)} потребовал пересмотр карт указа`,
+  };
+}
+
 export function readySpell(
   g: Game,
   patch: Decree,
@@ -800,6 +866,7 @@ export function readySpell(
     g.authorityEpoch !== epoch ||
     !actingLeader(g, g.spell.team) ||
     !validPlayerDecree(patch) ||
+    decreeUsesBanned(g, patch) ||
     (debuff !== null && !validDebuff(debuff))
   )
     return g;
@@ -968,6 +1035,10 @@ export function tick(previous: Game, dt = 0.05): Game {
     announcement:
       previous.announcement && previous.announcement.until > previous.age + dt
         ? previous.announcement
+        : undefined,
+    epochBanner:
+      previous.epochBanner && previous.epochBanner.until > previous.age + dt
+        ? previous.epochBanner
         : undefined,
     elapsed: previous.elapsed + dt,
     flash: null,
@@ -1227,7 +1298,8 @@ export function tick(previous: Game, dt = 0.05): Game {
             1.8 *
             g.speed[p.team] *
             mod(p.team, 'speed') *
-            chaosSpeedMult(g.chaosRules, g.age, p.team)) /
+            chaosSpeedMult(g.chaosRules, g.age, p.team) *
+            variantSpeedMult(p.variant)) /
             Math.max(1, d),
       );
       p.x = p.sx + (dest.x - p.sx) * p.progress;
@@ -1297,8 +1369,13 @@ export function tick(previous: Game, dt = 0.05): Game {
       ? MOVE_SPEED * ((WORLD_WIDTH + WORLD_HEIGHT) / 200)
       : MOVE_SPEED;
     const marchDelta =
-      (dt * pace * boost * g.speed[p.team] * mod(p.team, 'speed') *
-        chaosSpeedMult(g.chaosRules, g.age, p.team)) /
+      (dt *
+        pace *
+        boost *
+        g.speed[p.team] *
+        mod(p.team, 'speed') *
+        chaosSpeedMult(g.chaosRules, g.age, p.team) *
+        variantSpeedMult(p.variant)) /
       Math.max(1, span);
     if (chaosReverseMarch(g.chaosRules, g.age, p.team))
       p.progress = Math.max(0, p.progress - marchDelta);
@@ -1645,6 +1722,7 @@ export function tick(previous: Game, dt = 0.05): Game {
     }
   }
   g = refreshAuthority(g);
+  g = updateEpochObjective(g, dt, g.authority);
   if (
     g.age >= DEVELOPMENT_SECONDS &&
     g.authority &&
@@ -1679,6 +1757,7 @@ export function tick(previous: Game, dt = 0.05): Game {
         spell.team,
         spell.patch,
         spell.epoch,
+        spell.prompt,
       );
       if (spell.debuff) {
         g.curses = [
@@ -1687,9 +1766,19 @@ export function tick(previous: Game, dt = 0.05): Game {
         ];
         g.notice += ` Побочный эффект: ${spell.debuff.title}.`;
       }
+      const ranked = earnedRank(g);
+      if (ranked[0]?.team === spell.team && ranked[1]) {
+        const runner = ranked[1].team;
+        const curse = proceduralDebuff(
+          Math.abs(runner.charCodeAt(0) * 997 + spell.epoch * 131),
+        );
+        g.curses = [...(g.curses ?? []), { team: spell.team, debuff: curse, at: g.age }];
+        g.notice += ` Проклятие от ${playerName(g, runner)}: ${curse.title}.`;
+      }
     } else if (
       !spell.patch &&
-      g.age - spell.startedAt > DECREE_RESPONSE_SECONDS
+      g.age - spell.startedAt >
+        DECREE_RESPONSE_SECONDS + (g.spellVetoDelay ?? 0)
     ) {
       g.spell = undefined;
       g.notice = 'Время ожидания приказа истекло';
@@ -1839,6 +1928,7 @@ export function applyDecree(
   team: Team,
   p: Decree,
   epoch: number,
+  headline = '',
 ): Game {
   if (g.age < DEVELOPMENT_SECONDS)
     return { ...g, notice: 'Право промпта откроется после 4 минут развития.' };
@@ -1972,7 +2062,19 @@ export function applyDecree(
     }
   }
   const text = log.join(' · ');
+  const title = headline.trim().slice(0, 80) || text.slice(0, 80);
   next.decreeLog = [{ team, text, at: g.elapsed }, ...g.decreeLog].slice(0, 5);
+  next.decreeChronicle = [
+    { team, title, epoch, at: g.elapsed },
+    ...(next.decreeChronicle ?? g.decreeChronicle ?? []),
+  ].slice(0, 5);
+  next.epochBanner = {
+    team,
+    title,
+    epoch,
+    until: next.age + 8,
+    instant: decreeHasInstantReveal(p),
+  };
   next.notice = `Указ: ${playerName(g, team)} — ${text}.`;
   next.automation = next.automation.filter(
     (a) => next.towers.find((t) => t.id === a.from)?.team === a.team,

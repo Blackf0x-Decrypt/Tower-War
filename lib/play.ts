@@ -11,6 +11,7 @@ import {
   sendScout,
   setAutomation,
   specialize,
+  decreeVeto,
   startSpell,
   upgrade,
   upgradeCannon,
@@ -43,7 +44,8 @@ export type PlayAction =
       debuff: Debuff | null;
       roll: string;
     }
-  | { type: 'spell-cancel'; nonce?: number };
+  | { type: 'spell-cancel'; nonce?: number }
+  | { type: 'decree-veto'; mode: 'delay' | 'reroll' };
 
 function num(value: unknown) {
   return typeof value === 'number' && Number.isFinite(value);
@@ -106,6 +108,12 @@ export function applyPlay(g: Game, actor: Team, action: PlayAction): Game {
       if (typeof action.nonce === 'number' && g.spell.nonce !== action.nonce)
         return g;
       return { ...g, spell: undefined };
+    case 'decree-veto':
+      return decreeVeto(
+        g,
+        actor,
+        action.mode === 'reroll' ? 'reroll' : 'delay',
+      );
     default:
       return g;
   }

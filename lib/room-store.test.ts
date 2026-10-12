@@ -23,6 +23,7 @@ import {
   DECREE_RESPONSE_SECONDS,
   DEVELOPMENT_SECONDS,
   applyDecree,
+  decreeVeto,
   humanTeams,
   initialGame,
   readySpell,
@@ -1538,5 +1539,83 @@ describe('seat release and four players', { concurrency: 1 }, () => {
     const endViews = await Promise.all(ids.map((id) => roomView(id)));
     assert.ok(endViews.every((view) => view.game?.result === 'red'));
     assert.ok(endViews.every((view) => view.revision === endViews[0].revision));
+  });
+});
+
+describe('epoch politics and lobby bans', () => {
+  test('lobby chaos ban persists and excludes candidates', async () => {
+    const kv = createMemoryKv();
+    setRoomKvForTests(kv);
+    const a = await roomCommand({
+      op: 'join',
+      team: 'you',
+      name: 'A',
+    });
+    const b = await roomCommand({
+      op: 'join',
+      team: 'red',
+      name: 'B',
+      playerId: crypto.randomUUID(),
+    });
+    assert.ok(a.playerId && b.playerId);
+    await roomCommand({ op: 'ready', playerId: a.playerId });
+    const ready = await roomCommand({ op: 'ready', playerId: b.playerId });
+    assert.ok(ready.startAt);
+    const ban = await roomCommand({
+      op: 'chaos-ban',
+      playerId: a.playerId,
+      kinds: ['chaos_march_speed', 'chaos_hq_shield'],
+    });
+    assert.equal(ban.error, undefined);
+    assert.deepEqual(ban.chaosBans?.you, [
+      'chaos_march_speed',
+      'chaos_hq_shield',
+    ]);
+    const filtered = localDecreeCandidates('test', [
+      'chaos_march_speed',
+      'chaos_hq_shield',
+    ]);
+    assert.equal(filtered.length, 3);
+    const blob = JSON.stringify(filtered);
+    assert.ok(!blob.includes('chaos_march_speed'));
+    assert.ok(!blob.includes('chaos_hq_shield'));
+  });
+
+  test('non-leader veto adds delay once', () => {
+    let g = initialGame();
+    g.age = DEVELOPMENT_SECONDS + 5;
+    g.elapsed = DEVELOPMENT_SECONDS + 5;
+    g.humans = ['you', 'red'];
+    g.wallets.you.earned = 200;
+    g.wallets.red.earned = 50;
+    g = refreshAuthority(g);
+    g = startSpell(g, g.authority!, 'тест');
+    const veto = decreeVeto(g, 'red', 'delay');
+    assert.equal(veto.spellVetoDelay, 10);
+    assert.equal(veto.teamVetoUsed?.red, true);
+    assert.equal(decreeVeto(veto, 'red', 'delay'), veto);
+  });
+
+  test('match bootstrap sets mutation and objective', async () => {
+    const kv = createMemoryKv();
+    setRoomKvForTests(kv);
+    const ids: string[] = [];
+    for (const team of ['you', 'red'] as const) {
+      const joined = await roomCommand({
+        op: 'join',
+        team,
+        name: team,
+      });
+      assert.ok(joined.playerId);
+      ids.push(joined.playerId!);
+      await roomCommand({ op: 'ready', playerId: joined.playerId });
+    }
+    const room = roomFromJson((await kv.get(ROOM_KEY))!);
+    room.startAt = Date.now() - 1;
+    await kv.set(ROOM_KEY, roomToJson(room));
+    const view = await roomView(ids[0]);
+    assert.ok(view.game?.mapMutation);
+    assert.ok(view.game?.epochObjective);
+    assert.ok(view.game?.matchMutator);
   });
 });
