@@ -141,7 +141,7 @@ export const TroopLayer = memo(function TroopLayer({camera, viewport, speech, pa
             ctx.lineCap='round';
             dash[0]=10*zoom; dash[1]=8*zoom;
             ctx.setLineDash(dash);
-            ctx.strokeStyle='#c4a15a99'; ctx.lineWidth=3*zoom;
+            ctx.strokeStyle='#b8924ecc'; ctx.lineWidth=3*zoom;
             const cargoRoutes=new Set<string>();
             for(const p of f.troops){
               if(!p.cargo||p.delay>0)continue;
@@ -210,12 +210,12 @@ export const TroopLayer = memo(function TroopLayer({camera, viewport, speech, pa
               if(p.cargo){
                 ctx.translate(0,-8);
                 drawWheel(-10,0);drawWheel(10,0);
-                ctx.fillStyle='#8a552c';ctx.strokeStyle='#5c3818';ctx.lineWidth=1.5;
+                ctx.fillStyle='#7a4a28';ctx.strokeStyle='#4a2f1a';ctx.lineWidth=1.5;
                 ctx.beginPath();ctx.roundRect(-16,-8,32,16,3);ctx.fill();ctx.stroke();
-                ctx.fillStyle=p.haul?.resources&&!p.haul.gold?'#6fa84a':'#f0c14a';
+                ctx.fillStyle=p.haul?.resources&&!p.haul.gold?'#5a9a3a':'#e8b85a';
                 ctx.beginPath();ctx.moveTo(-11,-8);ctx.lineTo(-4,-18);ctx.lineTo(3,-8);ctx.fill();
                 ctx.beginPath();ctx.moveTo(-2,-8);ctx.lineTo(5,-17);ctx.lineTo(12,-8);ctx.fill();
-                ctx.font='bold 12px Arial';ctx.textAlign='center';ctx.fillStyle='#fff';ctx.strokeStyle='#805025';ctx.lineWidth=3;
+                ctx.font='bold 12px Rubik, sans-serif';ctx.textAlign='center';ctx.fillStyle='#fff';ctx.strokeStyle='#6b442b';ctx.lineWidth=3;
                 const text=p.haul?String(Math.floor(p.haul.gold+p.haul.resources)):`+${p.strength}`;
                 ctx.strokeText(text,0,-24);ctx.fillText(text,0,-24);
               }else if(sprites[p.team]){
@@ -231,7 +231,7 @@ export const TroopLayer = memo(function TroopLayer({camera, viewport, speech, pa
                   ctx.roundRect(-14, -28, 28, 34, 4);
                   ctx.fill();
                   ctx.stroke();
-                  ctx.fillStyle = '#f4e8c8';
+                  ctx.fillStyle = '#fff8e6';
                   ctx.beginPath();
                   ctx.arc(0, -22, 6, 0, Math.PI * 2);
                   ctx.fill();
@@ -260,12 +260,12 @@ export const TroopLayer = memo(function TroopLayer({camera, viewport, speech, pa
                   ctx.drawImage(sprites[p.team], -19, -24, 38, 48);
                 }
                 ctx.restore();
-                if(p.scoutUntil||p.elite){ctx.fillStyle='#fff1a2';ctx.font='bold 14px Arial';ctx.fillText(p.elite?'★':'◉',-6,-46);}
+                if(p.scoutUntil||p.elite){ctx.fillStyle='#ffd465';ctx.font='bold 14px Rubik, sans-serif';ctx.fillText(p.elite?'★':'◉',-6,-46);}
               }
               if(f.speech&&!f.hideMessages&&p.speech&&p.progress>.07&&p.progress<.8){
-                ctx.font='12px Arial';ctx.textAlign='center';const w=widthOf(ctx,p.speech)+16;
-                ctx.fillStyle='#fff';ctx.beginPath();ctx.roundRect(-w/2,-68,w,23,7);ctx.fill();
-                ctx.fillStyle='#3b4937';ctx.fillText(p.speech,0,-52);
+                ctx.font='12px Rubik, sans-serif';ctx.textAlign='center';const w=widthOf(ctx,p.speech)+16;
+                ctx.fillStyle='#fff8e6';ctx.beginPath();ctx.roundRect(-w/2,-68,w,23,7);ctx.fill();
+                ctx.fillStyle='#3d2a1a';ctx.fillText(p.speech,0,-52);
               }
               ctx.restore();
             }

@@ -2,16 +2,37 @@
 <html lang="ru">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=1280" />
-  <title>Decree overlay preview</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Decree overlay preview — Солнечная долина</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Bitter:wght@700;800;900&family=Rubik:wght@400;700;800;900&display=swap" rel="stylesheet" />
   <style>
+    :root {
+      --valley-ink: #3d2a1a;
+      --valley-ink-soft: #6b5238;
+      --valley-cream: #fff8e6;
+      --valley-panel: #fff3d5;
+      --valley-honey: #e8b85a;
+      --valley-amber: #c9882e;
+      --valley-bark: #6b442b;
+      --valley-success: #5a9a3a;
+      --valley-border: #e8c98a;
+      --valley-border-deep: #a67a45;
+      --valley-overlay: rgba(47, 74, 34, 0.82);
+      --valley-grass-deep: #6a9a32;
+      --font-display: 'Bitter', Georgia, serif;
+      --font-ui: 'Rubik', system-ui, sans-serif;
+      --tap-min: 42px;
+      --focus-ring: #ffb82c;
+    }
     * { box-sizing: border-box; }
     html, body {
       margin: 0;
       min-height: 100%;
-      font-family: Arial, Helvetica, sans-serif;
-      background: #a3ce57;
-      color: #fffbea;
+      font-family: var(--font-ui);
+      background: linear-gradient(165deg, #9ecf4a 0%, #7fb83a 38%, #6a9f32 100%);
+      color: var(--valley-cream);
     }
     .preview-shell {
       max-width: 1280px;
@@ -20,11 +41,11 @@
     }
     .battle-card {
       position: relative;
-      height: 720px;
+      height: min(720px, 85dvh);
       border: 5px solid #ffdda0;
       border-radius: 24px;
-      box-shadow: 0 7px 0 #94713b, 0 12px 24px #405e3030;
-      background: #fff3d5;
+      box-shadow: 0 7px 0 #94713b, 0 12px 24px rgba(59, 81, 42, 0.22);
+      background: var(--valley-panel);
       overflow: hidden;
     }
     .battlefield {
@@ -32,13 +53,13 @@
       inset: 0;
       width: 100%;
       height: 100%;
-      background: #9fcf48;
+      background: radial-gradient(ellipse at center, #aed65e, #89b745);
       overflow: hidden;
     }
     .world-map {
       position: absolute;
       inset: 0;
-      background: #a9d950 linear-gradient(135deg, #b8e05a 0%, #8fc43f 50%, #a9d950 100%);
+      background: linear-gradient(135deg, #b8e05a 0%, #8fc43f 50%, #a9d950 100%);
     }
     .map-caption {
       position: absolute;
@@ -47,19 +68,20 @@
       z-index: 2;
       font-size: 11px;
       font-weight: 800;
-      letter-spacing: 1px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
       color: #fffbe5;
       text-shadow: 0 1px 3px #3b512a;
     }
-    .map-caption span { opacity: 0.85; font-weight: 600; margin-left: 6px; }
+    .map-caption span { opacity: 0.85; font-weight: 600; margin-left: 6px; letter-spacing: 0; text-transform: none; }
     .fake-tower {
       position: absolute;
       width: 72px;
       height: 92px;
       border-radius: 12px 12px 8px 8px;
       background: linear-gradient(#e8c98a, #c9954a);
-      border: 3px solid #8d6032;
-      box-shadow: 0 4px 0 #6b442b;
+      border: 3px solid var(--valley-bark);
+      box-shadow: 0 4px 0 var(--valley-bark);
     }
     .fake-tower::after {
       content: attr(data-n);
@@ -70,34 +92,118 @@
       min-width: 36px;
       padding: 2px 8px;
       border-radius: 8px;
-      background: #fff8e8;
-      color: #6b442b;
+      background: var(--valley-cream);
+      color: var(--valley-bark);
+      font-family: var(--font-display);
       font-weight: 900;
       font-size: 18px;
-      border: 2px solid #e8c98a;
+      border: 2px solid var(--valley-border);
     }
     .t1 { left: 18%; top: 28%; }
     .t2 { left: 42%; top: 52%; }
     .t3 { left: 68%; top: 22%; }
     .t4 { left: 78%; top: 58%; }
 
-    /* From app/globals.css — decree overlay block */
-    .decree-overlay{position:absolute;inset:0;z-index:195;display:flex;align-items:center;justify-content:center;padding:max(12px,env(safe-area-inset-top)) 12px max(12px,env(safe-area-inset-bottom));background:#1f3018c9;pointer-events:auto}
-    .decree-overlay-card{width:min(920px,100%);max-height:min(88dvh,100%);overflow:auto;padding:16px 18px;border:3px solid #ffe4ac;border-bottom:6px solid #8d6032;border-radius:20px;background:#fff3d5f2;color:#5c4328;box-shadow:0 12px 32px #1c331050}
-    .decree-overlay-head{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;margin-bottom:10px}
-    .decree-overlay-head h2{margin:0;font-size:clamp(17px,3.5vw,22px);color:#6b442b;flex:1}
-    .decree-overlay-timer{margin-left:auto;font-weight:900;font-size:15px;padding:6px 10px;border-radius:10px;background:#f7dba2;border:2px solid #e8c07a;color:#6b442b}
-    .decree-overlay-lead{margin:0 0 12px;font-size:13px;line-height:1.45;color:#7a5a38}
-    .decree-candidates--overlay{display:flex;flex-direction:column;gap:10px;width:100%}
-    .decree-candidates--overlay .decree-candidate{width:100%;box-sizing:border-box}
-    .decree-candidate{display:flex;flex-direction:column;align-items:flex-start;gap:4px;text-align:left;padding:12px 13px;min-height:42px;border:2px solid #e8c98a;border-bottom:4px solid #a67a45;border-radius:14px;background:#fff8e8;color:#5c4328;font:inherit;cursor:pointer}
-    .decree-candidate b{font-size:14px;color:#6b442b}
-    .decree-candidate small{font-size:11px;color:#8a6845;font-style:italic}
-    .decree-candidate span{font-size:12px;font-weight:800;color:#3f6b2f}
-    .decree-candidate em{font-size:11px;color:#7a5a38;font-style:normal;line-height:1.35}
-    .decree-candidate--custom{background:#f7e6c8;border-color:#dca957}
-    .decree-overlay-foot{margin-top:12px;font-size:11px;color:#7a5a38}
-    .eyebrow{display:block;letter-spacing:1.5px;font-size:10px;font-weight:750;color:#a47a45}
+    /* Synced with app/globals.css — decree overlay */
+    .decree-overlay {
+      position: absolute;
+      inset: 0;
+      z-index: 195;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: max(12px, env(safe-area-inset-top)) 12px max(12px, env(safe-area-inset-bottom));
+      background: var(--valley-overlay);
+      backdrop-filter: blur(10px);
+      pointer-events: auto;
+    }
+    .decree-overlay-card {
+      width: min(920px, 100%);
+      max-height: min(88dvh, 100%);
+      overflow: auto;
+      padding: 16px 18px;
+      border: 3px solid var(--valley-border);
+      border-bottom: 6px solid var(--valley-bark);
+      border-radius: 20px;
+      background: color-mix(in srgb, var(--valley-panel) 95%, transparent);
+      color: var(--valley-ink-soft);
+      box-shadow: 0 16px 48px rgba(28, 51, 16, 0.38);
+    }
+    .decree-overlay-head {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px 12px;
+      margin-bottom: 10px;
+    }
+    .decree-overlay-head h2 {
+      margin: 0;
+      font-family: var(--font-display);
+      font-size: clamp(17px, 3.5vw, 22px);
+      color: var(--valley-bark);
+      flex: 1;
+      letter-spacing: -0.02em;
+    }
+    .decree-overlay-timer {
+      margin-left: auto;
+      font-weight: 900;
+      font-size: 15px;
+      padding: 6px 10px;
+      border-radius: 10px;
+      background: #f7dba2;
+      border: 2px solid var(--valley-border);
+      color: var(--valley-bark);
+    }
+    .decree-overlay-lead {
+      margin: 0 0 12px;
+      font-size: 13px;
+      line-height: 1.45;
+      color: var(--valley-ink-soft);
+    }
+    .decree-candidates--overlay {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      width: 100%;
+    }
+    .decree-candidates--overlay .decree-candidate { width: 100%; box-sizing: border-box; }
+    .decree-candidate {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 4px;
+      text-align: left;
+      padding: 12px 13px;
+      min-height: var(--tap-min);
+      border: 2px solid var(--valley-border);
+      border-bottom: 4px solid var(--valley-border-deep);
+      border-radius: 14px;
+      background: var(--valley-cream);
+      color: var(--valley-ink-soft);
+      font: inherit;
+      cursor: pointer;
+      transition: transform 150ms ease, background 150ms ease;
+    }
+    .decree-candidate:hover {
+      transform: translateY(-2px);
+      background: #fffdf0;
+      border-color: var(--valley-honey);
+    }
+    .decree-candidate b { font-size: 14px; color: var(--valley-bark); }
+    .decree-candidate small { font-size: 11px; color: #8a6845; font-style: italic; }
+    .decree-candidate span { font-size: 12px; font-weight: 800; color: var(--valley-success); }
+    .decree-candidate em { font-size: 11px; color: var(--valley-ink-soft); font-style: normal; line-height: 1.35; }
+    .decree-candidate--custom { background: #f7e6c8; border-color: var(--valley-amber); }
+    .decree-overlay-foot { margin-top: 12px; font-size: 11px; color: var(--valley-ink-soft); }
+    .eyebrow {
+      display: block;
+      letter-spacing: 0.12em;
+      font-size: 10px;
+      font-weight: 750;
+      text-transform: uppercase;
+      color: var(--valley-amber);
+    }
+    button:focus-visible { outline: 3px solid var(--focus-ring); outline-offset: 4px; }
   </style>
 </head>
 <body>
@@ -105,7 +211,7 @@
     <div class="battle-card">
       <div class="battlefield">
         <div class="world-map">
-          <div class="map-caption">СОЛНЕЧНАЯ ДОЛИНА <span>36° N · 24° E</span></div>
+          <div class="map-caption">Солнечная долина <span>36° N · 24° E</span></div>
           <div class="fake-tower t1" data-n="12"></div>
           <div class="fake-tower t2" data-n="8"></div>
           <div class="fake-tower t3" data-n="15"></div>
@@ -114,7 +220,7 @@
         <div class="decree-overlay" role="dialog" aria-labelledby="decree-overlay-title" aria-modal="true">
           <section class="decree-overlay-card">
             <header class="decree-overlay-head">
-              <span class="eyebrow">ПРАВО ЛИДЕРА</span>
+              <span class="eyebrow">Право лидера</span>
               <h2 id="decree-overlay-title">Ваш указ · 30 секунд</h2>
               <span class="decree-overlay-timer">24.3 с</span>
             </header>
